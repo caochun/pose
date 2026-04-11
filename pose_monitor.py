@@ -2,49 +2,55 @@
 姿态监控：检测画面中的人是坐着还是站立，并记录时长
 使用 GStreamer appsink + YOLOv8-pose RKNN NPU 推理
 
+架构：
+- 主进程：GStreamer采集 + 推流（永不重启，推流不中断）
+- 推理子进程：RKNN推理隔离，RSS超限时独立重启，主进程无感知
+
 优化：
-- 异步推理线程：推流帧率不受 NPU 推理延迟影响
-- NV12 输出：省去 BGR→NV12 软件 videoconvert
-- 推理限频：每 N 帧推理一次，其余帧复用上次结果
+- 异步推理：推流帧率不受 NPU 推理延迟影响
+- NV12 直通：省去 BGR→NV12 软件 videoconvert
+- 推理子进程隔离：librknnrt.so 内存只在子进程积累，重启不影响推流
 """
 import os
 os.environ['RKNN_LOG_LEVEL'] = '0'
+
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
+
 import numpy as np
 import cv2
 import time
 import csv
+import sys
 import threading
-import queue
 import argparse
+import ctypes
+import multiprocessing as mp
 from datetime import datetime
-from rknnlite.api import RKNNLite
+
+# ─── glibc 调优（主进程） ───────────────────────────────────────
+try:
+    _libc = ctypes.cdll.LoadLibrary('libc.so.6')
+    _libc.mallopt(ctypes.c_int(-8), ctypes.c_int(2))  # MALLOC_ARENA_MAX=2
+    def malloc_trim(): _libc.malloc_trim(0)
+except Exception:
+    def malloc_trim(): pass
 
 Gst.init(None)
 
 # ─── YOLOv8-pose 关键点索引 (COCO 17点) ───
-KP_NOSE       = 0
-KP_LEFT_EYE   = 1
-KP_RIGHT_EYE  = 2
-KP_LEFT_EAR   = 3
-KP_RIGHT_EAR  = 4
-KP_LEFT_SHLDR = 5
-KP_RIGHT_SHLDR= 6
-KP_LEFT_ELBOW = 7
-KP_RIGHT_ELBOW= 8
-KP_LEFT_WRIST = 9
-KP_RIGHT_WRIST= 10
-KP_LEFT_HIP   = 11
-KP_RIGHT_HIP  = 12
-KP_LEFT_KNEE  = 13
-KP_RIGHT_KNEE = 14
-KP_LEFT_ANKLE = 15
-KP_RIGHT_ANKLE= 16
+KP_NOSE, KP_LEFT_EYE, KP_RIGHT_EYE = 0, 1, 2
+KP_LEFT_EAR, KP_RIGHT_EAR = 3, 4
+KP_LEFT_SHLDR, KP_RIGHT_SHLDR = 5, 6
+KP_LEFT_ELBOW, KP_RIGHT_ELBOW = 7, 8
+KP_LEFT_WRIST, KP_RIGHT_WRIST = 9, 10
+KP_LEFT_HIP, KP_RIGHT_HIP = 11, 12
+KP_LEFT_KNEE, KP_RIGHT_KNEE = 13, 14
+KP_LEFT_ANKLE, KP_RIGHT_ANKLE = 15, 16
 
-INPUT_SIZE = 640
-NMS_THRESH = 0.45
+INPUT_SIZE  = 640
+NMS_THRESH  = 0.45
 CONF_THRESH = 0.35
 
 
@@ -70,142 +76,203 @@ def softmax(x, axis=-1):
 
 
 def decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h):
-    keypoints_all = outputs[3]  # (1, 17, 3, 8400)
+    keypoints_all = outputs[3]
     boxes = []
-    strides = [8, 16, 32]
-    grid_sizes = [80, 40, 20]
-
+    strides, grid_sizes = [8, 16, 32], [80, 40, 20]
     for i, (stride, gs) in enumerate(zip(strides, grid_sizes)):
         feat = outputs[i].reshape(1, 65, -1)
         bbox = feat[0, :64, :]
         conf = sigmoid(feat[0, 64, :])
-
         idx_start = sum(g*g for g in grid_sizes[:i])
         kps = keypoints_all[0, :, :, idx_start:idx_start+gs*gs]
-
         for ci in range(gs * gs):
             if conf[ci] < CONF_THRESH:
                 continue
-            cx = ci % gs
-            cy = ci // gs
-
-            b = bbox[:, ci].reshape(4, 16)
-            b = softmax(b, axis=1)
+            cx, cy = ci % gs, ci // gs
+            b = softmax(bbox[:, ci].reshape(4, 16), axis=1)
             b = (b * np.arange(16)).sum(axis=1)
-            x1 = (cx + 0.5 - b[0]) * stride
-            y1 = (cy + 0.5 - b[1]) * stride
-            x2 = (cx + 0.5 + b[2]) * stride
-            y2 = (cy + 0.5 + b[3]) * stride
-
-            x1 = (x1 - pad_x) / scale
-            y1 = (y1 - pad_y) / scale
-            x2 = (x2 - pad_x) / scale
-            y2 = (y2 - pad_y) / scale
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(orig_w, x2), min(orig_h, y2)
-
+            x1 = max(0, ((cx + 0.5 - b[0]) * stride - pad_x) / scale)
+            y1 = max(0, ((cy + 0.5 - b[1]) * stride - pad_y) / scale)
+            x2 = min(orig_w, ((cx + 0.5 + b[2]) * stride - pad_x) / scale)
+            y2 = min(orig_h, ((cy + 0.5 + b[3]) * stride - pad_y) / scale)
             kp = kps[:, :, ci]
             kp_coords = kp[:, :2].copy()
             kp_coords[:, 0] = (kp_coords[:, 0] - pad_x) / scale
             kp_coords[:, 1] = (kp_coords[:, 1] - pad_y) / scale
-            kp_confs = kp[:, 2]
-
-            boxes.append([x1, y1, x2, y2, float(conf[ci]), kp_coords, kp_confs])
-
+            boxes.append([x1, y1, x2, y2, float(conf[ci]), kp_coords, kp[:, 2]])
     if not boxes:
         return []
-
     scores = np.array([b[4] for b in boxes])
     indices = cv2.dnn.NMSBoxes(
         [[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes],
-        scores.tolist(), CONF_THRESH, NMS_THRESH
-    )
-    if len(indices) == 0:
-        return []
-    return [boxes[i] for i in indices.flatten()]
+        scores.tolist(), CONF_THRESH, NMS_THRESH)
+    return [boxes[i] for i in indices.flatten()] if len(indices) else []
 
 
 def classify_pose(kp_coords, kp_confs, box):
     MIN_CONF = 0.3
     hip_ys, knee_ys = [], []
-    if kp_confs[KP_LEFT_HIP]   > MIN_CONF: hip_ys.append(kp_coords[KP_LEFT_HIP][1])
-    if kp_confs[KP_RIGHT_HIP]  > MIN_CONF: hip_ys.append(kp_coords[KP_RIGHT_HIP][1])
-    if kp_confs[KP_LEFT_KNEE]  > MIN_CONF: knee_ys.append(kp_coords[KP_LEFT_KNEE][1])
-    if kp_confs[KP_RIGHT_KNEE] > MIN_CONF: knee_ys.append(kp_coords[KP_RIGHT_KNEE][1])
-
+    for kp in [KP_LEFT_HIP, KP_RIGHT_HIP]:
+        if kp_confs[kp] > MIN_CONF: hip_ys.append(kp_coords[kp][1])
+    for kp in [KP_LEFT_KNEE, KP_RIGHT_KNEE]:
+        if kp_confs[kp] > MIN_CONF: knee_ys.append(kp_coords[kp][1])
     if not hip_ys or not knee_ys:
         return 'unknown'
-
     box_h = box[3] - box[1]
     if box_h < 1:
         return 'unknown'
-
-    vertical_ratio = (np.mean(knee_ys) - np.mean(hip_ys)) / box_h
-    return 'standing' if vertical_ratio > 0.15 else 'sitting'
+    return 'standing' if (np.mean(knee_ys) - np.mean(hip_ys)) / box_h > 0.15 else 'sitting'
 
 
 def draw_detections(frame, detections, pose):
-    """在 frame 上原地绘制骨骼点和姿态标签"""
     if not detections:
         return
     best = max(detections, key=lambda d: d[4])
     x1, y1, x2, y2 = int(best[0]), int(best[1]), int(best[2]), int(best[3])
-    color = (0, 255, 0) if pose == 'standing' else (0, 165, 255) if pose == 'sitting' else (128, 128, 128)
+    color = (0,255,0) if pose=='standing' else (0,165,255) if pose=='sitting' else (128,128,128)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, pose, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    kp_coords, kp_confs = best[5], best[6]
+    cv2.putText(frame, pose, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     for ki in range(17):
-        if kp_confs[ki] > 0.3:
-            cv2.circle(frame, (int(kp_coords[ki][0]), int(kp_coords[ki][1])), 4, (255, 0, 0), -1)
+        if best[6][ki] > 0.3:
+            cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255,0,0), -1)
 
 
+def _rss_mb():
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 推理子进程：独立运行 RKNN，RSS 超限时自行退出，由主进程重启
+# ═══════════════════════════════════════════════════════════════
+def _inference_process(model_path, frame_queue, result_queue,
+                       width, height, max_rss_mb):
+    """
+    推理子进程入口。
+    frame_queue:  主进程 → 子进程，item = (nv12_bytes, orig_w, orig_h)
+    result_queue: 子进程 → 主进程，item = (annotated_nv12_bytes, pose_str)
+                  或 None 表示子进程即将退出
+    """
+    os.environ['RKNN_LOG_LEVEL'] = '0'
+
+    # 子进程也做 malloc 调优
+    try:
+        import ctypes as _ct
+        _lc = _ct.cdll.LoadLibrary('libc.so.6')
+        _lc.mallopt(_ct.c_int(-8), _ct.c_int(1))  # 子进程单线程，1个arena
+        def _trim(): _lc.malloc_trim(0)
+    except Exception:
+        def _trim(): pass
+
+    from rknnlite.api import RKNNLite
+    rknn = RKNNLite(verbose=False)
+    rknn.load_rknn(model_path)
+    rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO)
+    print(f'[InferProc:{os.getpid()}] RKNN loaded, max_rss={max_rss_mb}MB', flush=True)
+
+    infer_count = 0
+    while True:
+        item = frame_queue.get()
+        if item is None:
+            break
+
+        nv12_bytes, orig_w, orig_h = item
+        nv12 = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(orig_h * 3 // 2, orig_w)
+
+        try:
+            bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            inp, scale, pad_x, pad_y = letterbox(bgr, INPUT_SIZE)
+            inp_rgb = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
+            outputs = rknn.inference(inputs=[inp_rgb[np.newaxis, :]])
+            detections = decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h)
+            pose = 'unknown'
+            if detections:
+                best = max(detections, key=lambda d: d[4])
+                pose = classify_pose(best[5], best[6], best[:4])
+
+            # 生成标注帧
+            bgr_ann = bgr.copy()
+            draw_detections(bgr_ann, detections, pose)
+            yuv = cv2.cvtColor(bgr_ann, cv2.COLOR_BGR2YUV_I420)
+            y = yuv[:orig_h]
+            u = yuv[orig_h:orig_h+orig_h//4].reshape(orig_h//2, orig_w//2)
+            v = yuv[orig_h+orig_h//4:].reshape(orig_h//2, orig_w//2)
+            uv = np.empty((orig_h//2, orig_w), dtype=np.uint8)
+            uv[:, 0::2] = u; uv[:, 1::2] = v
+            nv12_out = np.ascontiguousarray(np.vstack([y, uv]))
+
+            result_queue.put((bytes(nv12_out), pose))
+
+        except Exception as e:
+            print(f'[InferProc] error: {e}', flush=True)
+            result_queue.put((None, 'unknown'))
+
+        infer_count += 1
+        if infer_count % 100 == 0:
+            _trim()
+            rss = _rss_mb()
+            if rss > max_rss_mb:
+                print(f'[InferProc:{os.getpid()}] RSS {rss:.0f}MB > {max_rss_mb}MB, exiting for restart', flush=True)
+                result_queue.put(None)  # 通知主进程即将退出
+                break
+
+    rknn.release()
+    print(f'[InferProc:{os.getpid()}] exited after {infer_count} inferences', flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 主进程：采集 + 推流 + 子进程管理
+# ═══════════════════════════════════════════════════════════════
 class PoseMonitor:
     def __init__(self, model_path, camera='/dev/video0', log_file='pose_log.csv',
-                 width=1280, height=720, rtsp_url=None, infer_every=3):
-        self.model_path = model_path
-        self.camera = camera
-        self.log_file = log_file
-        self.width = width
-        self.height = height
-        self.rtsp_url = rtsp_url
-        self.infer_every = infer_every  # 每 N 帧推理一次
+                 width=1280, height=720, rtsp_url=None, infer_every=3,
+                 infer_max_rss=400):
+        self.model_path   = model_path
+        self.camera       = camera
+        self.log_file     = log_file
+        self.width        = width
+        self.height       = height
+        self.rtsp_url     = rtsp_url
+        self.infer_every  = infer_every
+        self.infer_max_rss = infer_max_rss  # 子进程 RSS 阈值
 
-        # 状态追踪
-        self.current_pose = None
+        # 姿态状态
+        self.current_pose   = None
         self.pose_start_time = None
-        self.session_stats = {'sitting': 0.0, 'standing': 0.0, 'unknown': 0.0}
-        self.last_log_time = time.time()
+        self.session_stats  = {'sitting': 0.0, 'standing': 0.0, 'unknown': 0.0}
+        self.last_log_time  = time.time()
 
-        # 异步推理
-        self.infer_queue = queue.Queue(maxsize=1)
-        self.last_detections = None
-        self.last_bgr = None
-        self.last_annotated_nv12 = None  # 推理线程写好的标注 NV12，回调直接用
-        self.frame_count = 0
+        # 推理子进程通信队列
+        self.frame_queue    = mp.Queue(maxsize=1)
+        self.result_queue   = mp.Queue(maxsize=2)
+        self._infer_proc    = None
 
-        self.rknn = None
-        self.pipeline = None
+        # 缓存
+        self.last_annotated_nv12 = None
+        self.last_pose      = 'unknown'
+        self.frame_count    = 0
+        self.frame_pts      = 0
+
+        # GStreamer
+        self.pipeline    = None
         self.out_pipeline = None
-        self.appsrc = None
-        self.frame_pts = 0
-        self.loop = None
-        self._infer_thread = None
+        self.appsrc      = None
+        self.loop        = None
 
-    def init_rknn(self):
-        print(f'Loading RKNN model: {self.model_path}')
-        self.rknn = RKNNLite(verbose=False)
-        if self.rknn.load_rknn(self.model_path) != 0:
-            raise RuntimeError('Failed to load RKNN model')
-        if self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO) != 0:
-            raise RuntimeError('Failed to init RKNN runtime')
-        print('RKNN model loaded OK')
-
+    # ── CSV 日志 ──────────────────────────────────────────────
     def init_csv(self):
         write_header = not os.path.exists(self.log_file)
-        self.csv_file = open(self.log_file, 'a', newline='')
+        self.csv_file   = open(self.log_file, 'a', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         if write_header:
-            self.csv_writer.writerow(['timestamp', 'pose', 'duration_sec', 'sitting_total', 'standing_total'])
+            self.csv_writer.writerow(
+                ['timestamp','pose','duration_sec','sitting_total','standing_total'])
         self.csv_file.flush()
 
     def log_pose_change(self, old_pose, duration):
@@ -216,12 +283,11 @@ class PoseMonitor:
         self.csv_writer.writerow([
             ts, old_pose, f'{duration:.1f}',
             f'{self.session_stats["sitting"]:.1f}',
-            f'{self.session_stats["standing"]:.1f}'
-        ])
+            f'{self.session_stats["standing"]:.1f}'])
         self.csv_file.flush()
         print(f'[{ts}] {old_pose} lasted {duration:.1f}s | '
-              f'Total sitting: {self.session_stats["sitting"]:.0f}s, '
-              f'standing: {self.session_stats["standing"]:.0f}s')
+              f'Sitting: {self.session_stats["sitting"]:.0f}s, '
+              f'Standing: {self.session_stats["standing"]:.0f}s')
 
     def update_state(self, new_pose):
         now = time.time()
@@ -230,109 +296,98 @@ class PoseMonitor:
                 duration = now - self.pose_start_time
                 if duration > 1.0:
                     self.log_pose_change(self.current_pose, duration)
-            self.current_pose = new_pose
+            self.current_pose    = new_pose
             self.pose_start_time = now
-
         if now - self.last_log_time > 30:
-            current_duration = now - (self.pose_start_time or now)
-            print(f'[Status] Current: {self.current_pose} ({current_duration:.0f}s) | '
+            dur = now - (self.pose_start_time or now)
+            print(f'[Status] Current: {self.current_pose} ({dur:.0f}s) | '
                   f'Sitting: {self.session_stats["sitting"]:.0f}s, '
-                  f'Standing: {self.session_stats["standing"]:.0f}s')
+                  f'Standing: {self.session_stats["standing"]:.0f}s | '
+                  f'MainRSS: {_rss_mb():.0f}MB')
             self.last_log_time = now
 
-    # ─── 异步推理线程（输入 BGR，NV12→BGR 在此完成）──────────────
-    def _inference_worker(self):
+    # ── 推理子进程管理 ────────────────────────────────────────
+    def _start_infer_proc(self):
+        p = mp.Process(
+            target=_inference_process,
+            args=(self.model_path, self.frame_queue, self.result_queue,
+                  self.width, self.height, self.infer_max_rss),
+            daemon=True)
+        p.start()
+        self._infer_proc = p
+        print(f'[Main] inference subprocess started PID={p.pid}')
+
+    def _result_reader(self):
+        """后台线程：读取子进程结果，检测子进程退出并重启"""
         while True:
-            item = self.infer_queue.get()
-            if item is None:
-                break
-            nv12_frame, (orig_w, orig_h) = item
             try:
-                # NV12→BGR（只在推理帧做，1/infer_every 频率）
-                bgr = cv2.cvtColor(nv12_frame, cv2.COLOR_YUV2BGR_NV12)
-                inp, scale, pad_x, pad_y = letterbox(bgr, INPUT_SIZE)
-                inp_rgb = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
-                outputs = self.rknn.inference(inputs=[inp_rgb[np.newaxis, :]])
-                detections = decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h)
-                pose = 'unknown'
-                if detections:
-                    best = max(detections, key=lambda d: d[4])
-                    pose = classify_pose(best[5], best[6], best[:4])
-                # 把 BGR 和检测结果缓存，供回调线程绘制
-                self.last_bgr = bgr
-                self.last_detections = (detections, pose)
-                self.update_state(pose)
+                item = self.result_queue.get(timeout=5)
+            except Exception:
+                # 超时：检查子进程是否还活着
+                if self._infer_proc and not self._infer_proc.is_alive():
+                    print('[Main] inference subprocess died unexpectedly, restarting...')
+                    self._start_infer_proc()
+                continue
 
-                # 推理线程做 BGR→NV12（仅 1/infer_every 频率），回调直接复用
-                bgr_ann = bgr.copy()
-                draw_detections(bgr_ann, detections, pose)
-                yuv = cv2.cvtColor(bgr_ann, cv2.COLOR_BGR2YUV_I420)
-                y = yuv[:orig_h]
-                u = yuv[orig_h:orig_h + orig_h // 4].reshape(orig_h // 2, orig_w // 2)
-                v = yuv[orig_h + orig_h // 4:].reshape(orig_h // 2, orig_w // 2)
-                uv = np.empty((orig_h // 2, orig_w), dtype=np.uint8)
-                uv[:, 0::2] = u
-                uv[:, 1::2] = v
-                self.last_annotated_nv12 = np.ascontiguousarray(np.vstack([y, uv]))
-            except Exception as e:
-                print(f'[Infer error] {e}')
-            finally:
-                self.infer_queue.task_done()
+            if item is None:
+                # 子进程主动退出（RSS超限），重启
+                if self._infer_proc:
+                    self._infer_proc.join(timeout=3)
+                print('[Main] restarting inference subprocess...')
+                # 清空 frame_queue 避免旧帧积压
+                while not self.frame_queue.empty():
+                    try: self.frame_queue.get_nowait()
+                    except: break
+                self._start_infer_proc()
+                continue
 
-    # ─── GStreamer 回调（NV12 快速路径）────────────────────────────
+            nv12_bytes, pose = item
+            if nv12_bytes is not None:
+                arr = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(
+                    self.height * 3 // 2, self.width)
+                self.last_annotated_nv12 = arr
+            self.last_pose = pose
+            self.update_state(pose)
+
+    # ── GStreamer 回调（主进程，30fps）────────────────────────
     def on_new_sample(self, appsink):
         sample = appsink.emit('pull-sample')
         if sample is None:
             return Gst.FlowReturn.OK
 
-        buf = sample.get_buffer()
+        buf  = sample.get_buffer()
         caps = sample.get_caps().get_structure(0)
-        w = caps.get_value('width')
-        h = caps.get_value('height')
+        w, h = caps.get_value('width'), caps.get_value('height')
 
-        success, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not success:
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
             return Gst.FlowReturn.OK
-
         try:
-            # NV12 帧：Y(H×W) + UV(H/2×W)，共 H*W*3//2 字节
-            nv12 = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(h * 3 // 2, w).copy()
+            nv12 = bytes(mapinfo.data)
 
-            # 每 infer_every 帧投递到推理线程
             self.frame_count += 1
             if self.frame_count % self.infer_every == 0:
                 try:
-                    self.infer_queue.put_nowait((nv12.copy(), (w, h)))
-                except queue.Full:
-                    pass
+                    self.frame_queue.put_nowait((nv12, w, h))
+                except Exception:
+                    pass  # 队列满，跳过本帧
 
-            # 推送到编码器
             if self.appsrc is not None:
                 ann = self.last_annotated_nv12
-                data = ann.tobytes() if ann is not None else bytes(mapinfo.data)
-
+                data = bytes(ann) if ann is not None else nv12
                 gbuf = Gst.Buffer.new_wrapped(data)
-                gbuf.pts = self.frame_pts
+                gbuf.pts      = self.frame_pts
                 gbuf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 30)
                 self.frame_pts += gbuf.duration
                 self.appsrc.emit('push-buffer', gbuf)
 
-            if args.show:
-                bgr_show = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
-                if self.last_detections:
-                    draw_detections(bgr_show, *self.last_detections)
-                cv2.imshow('Pose Monitor', bgr_show)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    self.loop.quit()
-        except Exception as e:
-            print(f'[Callback error] {e}')
         finally:
             buf.unmap(mapinfo)
 
         return Gst.FlowReturn.OK
 
+    # ── GStreamer 管线 ────────────────────────────────────────
     def build_pipeline(self):
-        # 输入：NV12 直出，省掉 videoconvert；30fps 全速给 appsink
         in_str = (
             f'v4l2src device={self.camera} ! '
             f'image/jpeg,width={self.width},height={self.height} ! '
@@ -344,31 +399,33 @@ class PoseMonitor:
         self.pipeline.get_by_name('sink').connect('new-sample', self.on_new_sample)
 
         if self.rtsp_url:
-            # NV12 直接给 mpph264enc，省掉 videoconvert
             caps = (f'video/x-raw,format=NV12,'
                     f'width={self.width},height={self.height},framerate=30/1')
             out_str = (
                 f'appsrc name=src is-live=true format=time block=false caps={caps} ! '
-                f'mpph264enc ! '
-                f'rtspclientsink protocols=tcp location={self.rtsp_url}'
+                f'mpph264enc ! rtspclientsink protocols=tcp location={self.rtsp_url}'
             )
             print(f'Output: {out_str}')
             self.out_pipeline = Gst.parse_launch(out_str)
             self.appsrc = self.out_pipeline.get_by_name('src')
 
+    # ── 主入口 ────────────────────────────────────────────────
     def run(self):
-        self.init_rknn()
         self.init_csv()
         self.build_pipeline()
 
-        # 启动推理线程
-        self._infer_thread = threading.Thread(target=self._inference_worker, daemon=True)
-        self._infer_thread.start()
+        # 启动推理子进程
+        self._start_infer_proc()
+
+        # 启动结果读取线程
+        t = threading.Thread(target=self._result_reader, daemon=True)
+        t.start()
 
         if self.out_pipeline:
             self.out_pipeline.set_state(Gst.State.PLAYING)
         self.pipeline.set_state(Gst.State.PLAYING)
-        print(f'Running. infer_every={self.infer_every}. Press Ctrl+C to stop.')
+        print(f'Running. infer_every={self.infer_every}, '
+              f'infer_max_rss={self.infer_max_rss}MB')
 
         self.loop = GLib.MainLoop()
         try:
@@ -376,10 +433,15 @@ class PoseMonitor:
         except KeyboardInterrupt:
             print('\nStopping...')
         finally:
-            # 停止推理线程
-            self.infer_queue.put(None)
-            self._infer_thread.join(timeout=3)
+            # 停止子进程
+            try: self.frame_queue.put_nowait(None)
+            except: pass
+            if self._infer_proc:
+                self._infer_proc.join(timeout=5)
+                if self._infer_proc.is_alive():
+                    self._infer_proc.terminate()
 
+            # 记录最后一段
             if self.current_pose and self.pose_start_time:
                 duration = time.time() - self.pose_start_time
                 if duration > 1.0:
@@ -388,38 +450,39 @@ class PoseMonitor:
             self.pipeline.set_state(Gst.State.NULL)
             if self.out_pipeline:
                 self.out_pipeline.set_state(Gst.State.NULL)
-            self.rknn.release()
             self.csv_file.close()
-            if args.show:
-                cv2.destroyAllWindows()
 
             print('\n=== Session Summary ===')
-            print(f'Sitting   : {self.session_stats["sitting"]:.0f}s ({self.session_stats["sitting"]/60:.1f} min)')
-            print(f'Standing  : {self.session_stats["standing"]:.0f}s ({self.session_stats["standing"]/60:.1f} min)')
-            print(f'No person : {self.session_stats["unknown"]:.0f}s ({self.session_stats["unknown"]/60:.1f} min)')
-            print(f'Log saved to: {self.log_file}')
+            for k in ('sitting', 'standing', 'unknown'):
+                v = self.session_stats[k]
+                print(f'{k:10s}: {v:.0f}s ({v/60:.1f} min)')
+            print(f'Log: {self.log_file}')
 
 
 if __name__ == '__main__':
+    mp.set_start_method('spawn')   # RKNN 需要干净的子进程环境
+
     parser = argparse.ArgumentParser(description='Pose Monitor - Sitting/Standing Detection')
-    parser.add_argument('--model', default='/home/orangepi/Develop/models/yolov8_pose/yolov8n-pose-rk3588-fp.rknn')
+    parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-rk3588-fp.rknn')
     parser.add_argument('--camera', default='/dev/video0')
     parser.add_argument('--log', default='pose_log.csv')
-    parser.add_argument('--width', type=int, default=1280)
+    parser.add_argument('--width',  type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--infer-every', type=int, default=3,
-                        help='每 N 帧推理一次 (默认3，即约 10fps 推理)')
-    parser.add_argument('--show', action='store_true')
+                        help='每 N 帧推理一次 (默认3，约10fps)')
+    parser.add_argument('--infer-max-rss', type=int, default=400,
+                        help='推理子进程 RSS 阈值 MB，超出则重启子进程 (默认400)')
     parser.add_argument('--stream', default=None, metavar='RTSP_URL')
     args = parser.parse_args()
 
     monitor = PoseMonitor(
-        model_path=args.model,
-        camera=args.camera,
-        log_file=args.log,
-        width=args.width,
-        height=args.height,
-        rtsp_url=args.stream,
-        infer_every=args.infer_every,
+        model_path    = args.model,
+        camera        = args.camera,
+        log_file      = args.log,
+        width         = args.width,
+        height        = args.height,
+        rtsp_url      = args.stream,
+        infer_every   = args.infer_every,
+        infer_max_rss = args.infer_max_rss,
     )
     monitor.run()

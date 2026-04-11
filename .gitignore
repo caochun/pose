@@ -1,18 +1,18 @@
 pose_log.csv
+*.tar.gz
+.codex
 __pycache__/
 *.pyc
 *.pyo
 *.so
 *.rknn
 mediamtx/mediamtx
-mediamtx/*.tar.gz
 rga_utils.py
 *.log
 
 # 第三方源码/二进制目录
 ffmpeg-rockchip/
 gst-rockchip/
-gst-rockchip.tar.gz
 mpp/
 rknn-llm/
 rknn_model_zoo/
