@@ -1,0 +1,17 @@
+[Unit]
+Description=MediaMTX RTSP/WebRTC/HLS Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/Develop/mediamtx
+ExecStart=/home/orangepi/Develop/mediamtx/mediamtx /home/orangepi/Develop/mediamtx/mediamtx.yml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

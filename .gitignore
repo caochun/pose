@@ -1,5 +1,6 @@
 pose_log.csv
 *.tar.gz
+*.img
 .codex
 __pycache__/
 *.pyc
@@ -17,3 +18,6 @@ mpp/
 rknn-llm/
 rknn_model_zoo/
 models/
+
+# 系统镜像
+Orangepi5_*/

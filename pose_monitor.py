@@ -124,14 +124,31 @@ def classify_pose(kp_coords, kp_confs, box):
     return 'standing' if (np.mean(knee_ys) - np.mean(hip_ys)) / box_h > 0.15 else 'sitting'
 
 
-def draw_detections(frame, detections, pose):
+def _fmt_duration(seconds):
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f'{h:02d}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
+
+
+def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0.0):
+    # 左上角统计信息
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for i, (label, val, color) in enumerate([
+        (f'Sit  {_fmt_duration(sitting_total)}',  sitting_total,  (0, 165, 255)),
+        (f'Std  {_fmt_duration(standing_total)}', standing_total, (0, 255,   0)),
+    ]):
+        y = 32 + i * 36
+        cv2.putText(frame, label, (8, y), font, 0.9, (0, 0, 0),   4, cv2.LINE_AA)
+        cv2.putText(frame, label, (8, y), font, 0.9, color,        2, cv2.LINE_AA)
+
     if not detections:
         return
     best = max(detections, key=lambda d: d[4])
     x1, y1, x2, y2 = int(best[0]), int(best[1]), int(best[2]), int(best[3])
     color = (0,255,0) if pose=='standing' else (0,165,255) if pose=='sitting' else (128,128,128)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, pose, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(frame, pose, (x1, y1-10), font, 0.8, color, 2)
     for ki in range(17):
         if best[6][ki] > 0.3:
             cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255,0,0), -1)
@@ -155,7 +172,7 @@ def _inference_process(model_path, frame_queue, result_queue,
                        width, height, max_rss_mb):
     """
     推理子进程入口。
-    frame_queue:  主进程 → 子进程，item = (nv12_bytes, orig_w, orig_h)
+    frame_queue:  主进程 → 子进程，item = (nv12_bytes, orig_w, orig_h, sitting_total, standing_total)
     result_queue: 子进程 → 主进程，item = (annotated_nv12_bytes, pose_str)
                   或 None 表示子进程即将退出
     """
@@ -182,7 +199,7 @@ def _inference_process(model_path, frame_queue, result_queue,
         if item is None:
             break
 
-        nv12_bytes, orig_w, orig_h = item
+        nv12_bytes, orig_w, orig_h, sitting_total, standing_total = item
         nv12 = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(orig_h * 3 // 2, orig_w)
 
         try:
@@ -198,7 +215,7 @@ def _inference_process(model_path, frame_queue, result_queue,
 
             # 生成标注帧
             bgr_ann = bgr.copy()
-            draw_detections(bgr_ann, detections, pose)
+            draw_detections(bgr_ann, detections, pose, sitting_total, standing_total)
             yuv = cv2.cvtColor(bgr_ann, cv2.COLOR_BGR2YUV_I420)
             y = yuv[:orig_h]
             u = yuv[orig_h:orig_h+orig_h//4].reshape(orig_h//2, orig_w//2)
@@ -368,7 +385,11 @@ class PoseMonitor:
             self.frame_count += 1
             if self.frame_count % self.infer_every == 0:
                 try:
-                    self.frame_queue.put_nowait((nv12, w, h))
+                    now = time.time()
+                    ongoing = now - (self.pose_start_time or now)
+                    sit = self.session_stats['sitting'] + (ongoing if self.current_pose == 'sitting' else 0)
+                    std = self.session_stats['standing'] + (ongoing if self.current_pose == 'standing' else 0)
+                    self.frame_queue.put_nowait((nv12, w, h, sit, std))
                 except Exception:
                     pass  # 队列满，跳过本帧
 
