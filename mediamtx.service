@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=orangepi
-WorkingDirectory=/home/orangepi/Develop/mediamtx
-ExecStart=/home/orangepi/Develop/mediamtx/mediamtx /home/orangepi/Develop/mediamtx/mediamtx.yml
+User=chun
+WorkingDirectory=/home/chun/Develop/pose/mediamtx
+ExecStart=/home/chun/Develop/pose/mediamtx/mediamtx /home/chun/Develop/pose/mediamtx/mediamtx.yml
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

@@ -5,11 +5,11 @@ Requires=mediamtx.service
 
 [Service]
 Type=simple
-User=orangepi
-WorkingDirectory=/home/orangepi/Develop
+User=chun
+WorkingDirectory=/home/chun/Develop/pose
 Environment=MALLOC_ARENA_MAX=2
 Environment=RKNN_LOG_LEVEL=0
-ExecStart=/usr/bin/python3 -u pose_monitor.py \
+ExecStart=/home/chun/Develop/pose/.venv/bin/python3 -u pose_monitor.py \
     --model models/yolov8_pose/yolov8n-pose-rk3588-fp.rknn \
     --width 1280 \
     --height 720 \

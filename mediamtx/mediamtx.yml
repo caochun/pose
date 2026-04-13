@@ -797,13 +797,9 @@ pathDefaults:
 # for example "~^(test1|test2)$" will match both "test1" and "test2",
 # for example "~^prefix" will match all paths that start with "prefix".
 paths:
-  cam:
-    # GStreamer 推流路径，由外部 gst-launch 推入
-    # 视频：http://192.168.30.129:8889/cam_web (WebRTC H264)
-    # RTSP：rtsp://192.168.30.129:8554/cam
-
-  cam_web:
-    # H.264 WebRTC 路径（保留）
+  # example:
+  # my_camera:
+  #   source: rtsp://my_camera
 
   # Settings under path "all_others" are applied to all paths that
   # do not match another entry.

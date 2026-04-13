@@ -1,5 +1,7 @@
 pose_log.csv
+*.whl
 *.tar.gz
+.venv/
 *.img
 .codex
 __pycache__/
