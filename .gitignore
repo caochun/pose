@@ -8,10 +8,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.so
-*.rknn
-mediamtx/mediamtx
-rga_utils.py
 *.log
+
+# mediamtx 二进制（yml 配置文件保留跟踪）
+mediamtx/mediamtx
+mediamtx/LICENSE
 
 # 第三方源码/二进制目录
 ffmpeg-rockchip/
@@ -19,7 +20,6 @@ gst-rockchip/
 mpp/
 rknn-llm/
 rknn_model_zoo/
-models/
 
 # 系统镜像
 Orangepi5_*/

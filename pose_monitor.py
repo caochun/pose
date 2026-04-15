@@ -12,6 +12,7 @@
 - 推理子进程隔离：librknnrt.so 内存只在子进程积累，重启不影响推流
 """
 import os
+import signal
 os.environ['RKNN_LOG_LEVEL'] = '0'
 
 import gi
@@ -27,7 +28,40 @@ import threading
 import argparse
 import ctypes
 import multiprocessing as mp
+import pathlib
 from datetime import datetime
+
+# ─── RGA 硬件色彩转换（可选，需要 rga_cvt.so + librga） ────────────────
+def _load_rga():
+    so = pathlib.Path(__file__).parent / 'rga_cvt.so'
+    if not so.exists():
+        return None
+    try:
+        lib = ctypes.CDLL(str(so))
+        for fn in ('rga_nv12_to_bgr', 'rga_bgr_to_nv12'):
+            f = getattr(lib, fn)
+            f.argtypes = [ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_int, ctypes.c_int]
+            f.restype = ctypes.c_int
+        return lib
+    except Exception as e:
+        print(f'[RGA] 加载失败: {e}，回退到 cv2', flush=True)
+        return None
+
+_rga = _load_rga()
+_RGA_OK = _rga is not None
+if _RGA_OK:
+    print('[RGA] 硬件色彩转换已启用')
+
+def _rga_nv12_to_bgr(nv12: np.ndarray, bgr: np.ndarray, w: int, h: int):
+    ret = _rga.rga_nv12_to_bgr(nv12.ctypes.data, bgr.ctypes.data, w, h)
+    if ret != 0:
+        raise RuntimeError(f'RGA NV12→BGR 失败: {ret}')
+
+def _rga_bgr_to_nv12(bgr: np.ndarray, nv12: np.ndarray, w: int, h: int):
+    ret = _rga.rga_bgr_to_nv12(bgr.ctypes.data, nv12.ctypes.data, w, h)
+    if ret != 0:
+        raise RuntimeError(f'RGA BGR→NV12 失败: {ret}')
 
 # ─── glibc 调优（主进程） ───────────────────────────────────────
 try:
@@ -49,7 +83,7 @@ KP_LEFT_HIP, KP_RIGHT_HIP = 11, 12
 KP_LEFT_KNEE, KP_RIGHT_KNEE = 13, 14
 KP_LEFT_ANKLE, KP_RIGHT_ANKLE = 15, 16
 
-INPUT_SIZE  = 640
+INPUT_SIZE  = 320
 NMS_THRESH  = 0.45
 CONF_THRESH = 0.35
 
@@ -121,39 +155,42 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
 
 
-def softmax(x, axis=-1):
-    e = np.exp(x - np.max(x, axis=axis, keepdims=True))
-    return e / e.sum(axis=axis, keepdims=True)
-
-
 def decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h):
-    keypoints_all = outputs[3]
-    boxes = []
-    strides, grid_sizes = [8, 16, 32], [80, 40, 20]
-    for i, (stride, gs) in enumerate(zip(strides, grid_sizes)):
-        feat = outputs[i].reshape(1, 65, -1)
-        bbox = feat[0, :64, :]
-        conf = sigmoid(feat[0, 64, :])
-        idx_start = sum(g*g for g in grid_sizes[:i])
-        kps = keypoints_all[0, :, :, idx_start:idx_start+gs*gs]
-        for ci in range(gs * gs):
-            if conf[ci] < CONF_THRESH:
-                continue
-            cx, cy = ci % gs, ci // gs
-            b = softmax(bbox[:, ci].reshape(4, 16), axis=1)
-            b = (b * np.arange(16)).sum(axis=1)
-            x1 = max(0, ((cx + 0.5 - b[0]) * stride - pad_x) / scale)
-            y1 = max(0, ((cy + 0.5 - b[1]) * stride - pad_y) / scale)
-            x2 = min(orig_w, ((cx + 0.5 + b[2]) * stride - pad_x) / scale)
-            y2 = min(orig_h, ((cy + 0.5 + b[3]) * stride - pad_y) / scale)
-            kp = kps[:, :, ci]
-            kp_coords = kp[:, :2].copy()
-            kp_coords[:, 0] = (kp_coords[:, 0] - pad_x) / scale
-            kp_coords[:, 1] = (kp_coords[:, 1] - pad_y) / scale
-            boxes.append([x1, y1, x2, y2, float(conf[ci]), kp_coords, kp[:, 2]])
-    if not boxes:
+    """
+    单输出格式 (1, 56, N)：
+      [0:4, :]  — (x1, y1, x2, y2) 已解码，模型输入坐标（INPUT_SIZE 空间）
+      [4,   :]  — 置信度 logit，需 sigmoid
+      [5::3, :] / [6::3, :] / [7::3, :] — 17 关键点的 x / y / visibility logit
+    """
+    o = outputs[0][0]          # (56, N)
+    conf = sigmoid(o[4])       # (N,)
+    mask = conf >= CONF_THRESH
+    if not mask.any():
         return []
-    scores = np.array([b[4] for b in boxes])
+
+    # bbox 为 (cx, cy, w, h) 格式，先转换为 xyxy，再映射回原图坐标
+    cx = o[0, mask]; cy = o[1, mask]; bw = o[2, mask]; bh_box = o[3, mask]
+    x1 = np.clip((cx - bw / 2 - pad_x) / scale, 0, orig_w)
+    y1 = np.clip((cy - bh_box / 2 - pad_y) / scale, 0, orig_h)
+    x2 = np.clip((cx + bw / 2 - pad_x) / scale, 0, orig_w)
+    y2 = np.clip((cy + bh_box / 2 - pad_y) / scale, 0, orig_h)
+    c  = conf[mask]
+
+    # 关键点：(17, 3, N) → 每关键点 (x, y, vis_logit)
+    kp_raw = o[5:, mask]              # (51, M)
+    kp     = kp_raw.reshape(17, 3, -1) # (17, 3, M)
+    kp_x   = (kp[:, 0, :] - pad_x) / scale  # (17, M) 原图坐标
+    kp_y   = (kp[:, 1, :] - pad_y) / scale
+    kp_v   = sigmoid(kp[:, 2, :])            # (17, M) visibility
+
+    M = int(mask.sum())
+    boxes = []
+    for i in range(M):
+        kp_coords = np.stack([kp_x[:, i], kp_y[:, i]], axis=1)  # (17, 2)
+        boxes.append([float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]),
+                      float(c[i]), kp_coords, kp_v[:, i]])
+
+    scores  = np.array([b[4] for b in boxes])
     indices = cv2.dnn.NMSBoxes(
         [[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes],
         scores.tolist(), CONF_THRESH, NMS_THRESH)
@@ -220,19 +257,24 @@ def _fmt_duration(seconds):
     return f'{h:02d}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
 
 
-def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0.0, stats=None):
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    h, w = frame.shape[:2]
+# ── 面板固定布局尺寸（与 draw_panel 内常量保持一致） ────────────
+_PANEL_EVERY = 8    # 每 N 帧重绘面板（15fps → ~2fps）
+_PANEL_PW    = 328  # pad(10)+lk(54)+lgap(10)+lv(90)+sep(10)+rk(54)+rv(90)+pad(10)
+_PANEL_PH    = 260  # pad(10)+rows(8)×lh(30)+pad(10)
+_PANEL_RY    = 8    # 距顶部距离
 
-    # ── 右上角：合并面板（左列坐站时长，右列性能指标） ───────────
+
+def draw_panel(frame, pose, sitting_total, standing_total, stats):
+    """绘制右上角统计面板。每 _PANEL_EVERY 帧调用一次，结果缓存贴图。"""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    w = frame.shape[1]
+
     pad, lh = 10, 30
-    # 坐姿评分颜色
     post = stats.get('posture', 100) if stats else 100
     post_col = ((0,255,128) if post >= 80 else
                 (0,200,255) if post >= 60 else
                 (0,80, 255))
 
-    # 亮度辅助（需在 left_rows 前计算）
     def _lux_col(y):
         if y > 180: return (220, 255, 255)
         if y >  80: return (0,   255, 128)
@@ -248,29 +290,24 @@ def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0
     blit = stats.get('backlit', False) if stats else False
     lux_col = (80, 80, 255) if blit else _lux_col(ym)
 
-    # 左列：LUX / SIT / STD / AWAY / CNT / POST / CONF
+    _now = datetime.now()
     left_rows = [
+        (None,   _now.strftime('%Y-%m-%d'),                (200, 200, 200)),
+        (None,   _now.strftime('%H:%M:%S'),                (255, 255, 255)),
         ('LUX',  _lux_label(ym, blit),                     lux_col),
         ('SIT',  _fmt_duration(sitting_total),             (0, 165, 255)),
         ('STD',  _fmt_duration(standing_total),            (0, 255,   0)),
         ('AWAY', _fmt_duration(stats.get('away', 0) if stats else 0),
                                                            (160, 160, 160)),
-        ('CNT',  (f'{stats.get("sit_cnt",0)}s '
-                  f'{stats.get("std_cnt",0)}w') if stats else '0s 0w',
-                                                           (200, 200, 200)),
         ('POST', f'{post}',                                post_col),
         ('CONF', f'{stats.get("conf", 0.0):.2f}' if stats else '0.00',
                                                            (255, 200, 50)),
     ]
-    # 右列：FPS / CPU / RSS / CONF / 温度
-    def _tcol(t):  # 温度颜色：绿→黄→红
+    def _tcol(t):
         if t < 60:  return (0, 255, 128)
         if t < 75:  return (0, 200, 255)
         return (0, 80, 255)
-    def _temp_str(t):
-        return f'{t:.0f}C'  # OpenCV Hershey 不支持 Unicode，用小圆+C 代替
     def _draw_temp(frame, x, y, t, col):
-        # 画数字+"C"，在"C"前用小圆圈模拟度符号
         s = f'{t:.0f}'
         cv2.putText(frame, s, (x, y), font, 0.60, col, 1, cv2.LINE_AA)
         tw = cv2.getTextSize(s, font, 0.60, 1)[0][0]
@@ -289,33 +326,28 @@ def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0
         ('SOC',  None, _tcol(stats.get("tsoc", 0)), stats.get("tsoc", 0)),
     ] if stats else []
 
-    n_rows  = max(len(left_rows), len(right_rows))
-    lk, lv = 54, 90  # 左列 key宽 / val宽（原36/72 的1.5倍）
-    lgap    = 10       # 左列 key与val之间的间距
-    rk, rv = 54, 90   # 右列 key宽 / val宽
-    sep     = 10       # 分隔列宽
-    pw = pad + lk + lgap + lv + sep + rk + rv + pad
-    ph = pad + n_rows * lh + pad
+    lk, lv, lgap, rk, rv, sep = 54, 90, 10, 54, 90, 10
+    pw = pad + lk + lgap + lv + sep + rk + rv + pad  # == _PANEL_PW
+    ph = pad + max(len(left_rows), len(right_rows)) * lh + pad  # == _PANEL_PH
 
-    rx, ry = w - pw - 8, 8
+    rx, ry = w - pw - 8, _PANEL_RY
 
-    # 半透明黑底
-    roi = frame[ry:ry+ph, rx:rx+pw]
-    cv2.addWeighted(np.zeros_like(roi), 0.55, roi, 0.45, 0, roi)
-    frame[ry:ry+ph, rx:rx+pw] = roi
+    # 实色深底（终点用 pw-1/ph-1，匹配 numpy slice 的左闭右开区间）
+    cv2.rectangle(frame, (rx, ry), (rx + pw - 1, ry + ph - 1), (20, 20, 20), -1)
 
-    # 竖分隔线
     sx = rx + pad + lk + lv + sep // 2
     cv2.line(frame, (sx, ry + 6), (sx, ry + ph - 6), (80, 80, 80), 1)
 
-    # 左列文字
     for j, (key, val, col) in enumerate(left_rows):
-        y = ry + pad + (j + 1) * lh - 4
+        y  = ry + pad + (j + 1) * lh - 4
         x0 = rx + pad
-        cv2.putText(frame, key, (x0,             y), font, 0.60, (160,160,160), 1, cv2.LINE_AA)
-        cv2.putText(frame, val, (x0 + lk + lgap, y), font, 0.60, col,           1, cv2.LINE_AA)
+        if key is None:
+            if val:
+                cv2.putText(frame, val, (x0, y), font, 0.60, col, 1, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, key, (x0,             y), font, 0.60, (160,160,160), 1, cv2.LINE_AA)
+            cv2.putText(frame, val, (x0 + lk + lgap, y), font, 0.60, col,           1, cv2.LINE_AA)
 
-    # 右列文字
     for j, (key, val, col, temp) in enumerate(right_rows):
         y  = ry + pad + (j + 1) * lh - 4
         x0 = rx + pad + lk + lv + sep
@@ -325,34 +357,39 @@ def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0
         else:
             cv2.putText(frame, val, (x0 + rk, y), font, 0.60, col, 1, cv2.LINE_AA)
 
-    # ── 久坐警告横幅 ──────────────────────────────────────────────
+
+def draw_overlay(frame, detections, pose, stats=None):
+    """久坐提醒横幅 + 检测框 + 关键点。每帧调用，开销低。"""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    h, w = frame.shape[:2]
+
     if stats:
-        cont = stats.get('cont_sit', 0)
+        cont   = stats.get('cont_sit', 0)
         remind = stats.get('remind', 1800)
         if cont > 0 and cont >= remind:
             mins = int(cont // 60)
             msg  = f'Stand up! Sitting {mins} min'
             (tw, th), _ = cv2.getTextSize(msg, font, 0.85, 2)
-            bx = (w - tw) // 2 - 12
-            by = h - 52
-            roi2 = frame[by:by+th+20, bx:bx+tw+24]
-            cv2.addWeighted(np.full_like(roi2, (0, 0, 180)), 0.75,
-                            roi2, 0.25, 0, roi2)
-            frame[by:by+th+20, bx:bx+tw+24] = roi2
-            cv2.putText(frame, msg, (bx+12, by+th+6),
+            bx, by = (w - tw) // 2 - 12, h - 52
+            cv2.rectangle(frame, (bx, by), (bx + tw + 24, by + th + 20), (0, 0, 180), -1)
+            cv2.putText(frame, msg, (bx + 12, by + th + 6),
                         font, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # ── 检测框 + 关键点 ───────────────────────────────────────────
     if not detections:
         return
-    best = max(detections, key=lambda d: d[4])
+    best  = max(detections, key=lambda d: d[4])
     x1, y1, x2, y2 = int(best[0]), int(best[1]), int(best[2]), int(best[3])
     color = (0,255,0) if pose=='standing' else (0,165,255) if pose=='sitting' else (128,128,128)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, pose, (x1, y1-10), font, 0.8, color, 2)
+    cv2.putText(frame, pose, (x1, y1 - 10), font, 0.8, color, 2)
     for ki in range(17):
         if best[6][ki] > 0.3:
-            cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255,0,0), -1)
+            cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255, 0, 0), -1)
+
+
+def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0.0, stats=None):
+    draw_panel(frame, pose, sitting_total, standing_total, stats)
+    draw_overlay(frame, detections, pose, stats)
 
 
 def _rss_mb():
@@ -410,7 +447,11 @@ def _inference_process(model_path, frame_queue, result_queue,
         nv12 = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(orig_h * 3 // 2, orig_w)
 
         try:
-            bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            if _RGA_OK:
+                bgr = np.ascontiguousarray(np.empty((orig_h, orig_w, 3), dtype=np.uint8))
+                _rga_nv12_to_bgr(nv12, bgr, orig_w, orig_h)
+            else:
+                bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
             inp, scale, pad_x, pad_y = letterbox(bgr, INPUT_SIZE)
             inp_rgb = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             _t0 = time.time()
@@ -535,6 +576,11 @@ class PoseMonitor:
         self.frame_count      = 0
         self.frame_pts        = 0
 
+        # 预分配输出缓冲区（避免每帧 np.empty + vstack）
+        self._bgr_buf  = None   # (h, w, 3)   BGR 缓冲（RGA 输出）
+        self._uv_buf   = None   # (h//2, w)   UV 交错缓冲（cv2 fallback）
+        self._out_nv12 = None   # (h*3//2, w) 输出 NV12 缓冲
+
         # 串流帧率计数
         self._fps_count = 0
         self._fps_t0    = time.time()
@@ -546,6 +592,14 @@ class PoseMonitor:
         self.appsrc      = None
         self.loop        = None
         self.push_fail   = 0   # appsrc push-buffer 失败计数
+
+        # 输入管线自动恢复
+        self._last_frame_time    = time.time()
+        self._pipeline_restarting = False
+
+        # 面板缓存（节流绘制）
+        self._panel_cache = None   # 上次渲染的面板区域 (BGR numpy)
+        self._panel_count = 0
 
     # ── CSV 日志 ──────────────────────────────────────────────
     def init_csv(self):
@@ -651,7 +705,7 @@ class PoseMonitor:
             self.last_detections  = det_serial
             self.update_state(pose)
 
-    # ── GStreamer 回调（主进程，30fps）────────────────────────
+    # ── GStreamer 回调（主进程，15fps）────────────────────────
     def on_new_sample(self, appsink):
         sample = appsink.emit('pull-sample')
         if sample is None:
@@ -665,18 +719,18 @@ class PoseMonitor:
         if not ok:
             return Gst.FlowReturn.OK
         try:
+            self._last_frame_time = time.time()
             self.frame_count += 1
-            nv12_bytes = bytes(mapinfo.data)
 
-            # 每 infer_every 帧送一帧给推理子进程
+            # 每 infer_every 帧送一帧给推理子进程（只在需要时做整帧拷贝）
             if self.frame_count % self.infer_every == 0:
                 try:
-                    self.frame_queue.put_nowait((nv12_bytes, w, h))
+                    self.frame_queue.put_nowait((bytes(mapinfo.data), w, h))
                 except Exception:
                     pass  # 队列满，跳过
 
             if self.appsrc is not None:
-                # 每帧都绘制 overlay（使用最新缓存的推理结果），保证 30fps 流畅
+                # 每帧都绘制 overlay（使用最新缓存的推理结果）
                 now     = time.time()
                 self._fps_count += 1
                 _elapsed = now - self._fps_t0
@@ -695,23 +749,53 @@ class PoseMonitor:
                 stats['cont_sit'] = now - self.continuous_sit_start if self.continuous_sit_start else 0.0
                 stats['remind']   = self.sit_remind_secs
 
-                nv12 = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(h * 3 // 2, w)
-                bgr  = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
-                draw_detections(bgr, self.last_detections, self.last_pose, sit, std,
-                                stats if stats else None)
-                yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
-                y_p = yuv[:h]
-                u_p = yuv[h:h+h//4].reshape(h//2, w//2)
-                v_p = yuv[h+h//4:].reshape(h//2, w//2)
-                uv_p = np.empty((h//2, w), dtype=np.uint8)
-                uv_p[:, 0::2] = u_p; uv_p[:, 1::2] = v_p
-                out_bytes = np.ascontiguousarray(np.vstack([y_p, uv_p])).tobytes()
-                del nv12, bgr, yuv, y_p, u_p, v_p, uv_p
+                nv12 = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(h * 3 // 2, w)
+                # 首帧初始化预分配缓冲区
+                if self._out_nv12 is None:
+                    self._bgr_buf  = np.ascontiguousarray(
+                                         np.empty((h, w, 3), dtype=np.uint8))
+                    self._out_nv12 = np.ascontiguousarray(
+                                         np.empty((h * 3 // 2, w), dtype=np.uint8))
+                    self._uv_buf   = np.empty((h//2, w), dtype=np.uint8)
 
-                gbuf = Gst.Buffer.new_allocate(None, len(out_bytes), None)
-                gbuf.fill(0, out_bytes)
+                # NV12 → BGR
+                if _RGA_OK:
+                    _rga_nv12_to_bgr(nv12, self._bgr_buf, w, h)
+                    bgr = self._bgr_buf
+                else:
+                    bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+
+                # 面板：每 _PANEL_EVERY 帧重绘，其余帧贴缓存
+                self._panel_count += 1
+                rx = w - _PANEL_PW - 8
+                if self._panel_count % _PANEL_EVERY == 0 or self._panel_cache is None:
+                    draw_panel(bgr, self.last_pose, sit, std, stats)
+                    self._panel_cache = bgr[_PANEL_RY:_PANEL_RY+_PANEL_PH,
+                                            rx:rx+_PANEL_PW].copy()
+                else:
+                    bgr[_PANEL_RY:_PANEL_RY+_PANEL_PH, rx:rx+_PANEL_PW] = self._panel_cache
+                # 检测框 + 久坐提醒：每帧绘制（开销低）
+                draw_overlay(bgr, self.last_detections, self.last_pose, stats)
+
+                # BGR → NV12
+                if _RGA_OK:
+                    _rga_bgr_to_nv12(self._bgr_buf, self._out_nv12, w, h)
+                else:
+                    yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
+                    y_p = yuv[:h]
+                    u_p = yuv[h:h+h//4].reshape(h//2, w//2)
+                    v_p = yuv[h+h//4:].reshape(h//2, w//2)
+                    self._uv_buf[:, 0::2] = u_p
+                    self._uv_buf[:, 1::2] = v_p
+                    self._out_nv12[:h] = y_p
+                    self._out_nv12[h:] = self._uv_buf
+                    del bgr, yuv, y_p, u_p, v_p
+                del nv12
+
+                out_bytes = self._out_nv12.tobytes()
+                gbuf = Gst.Buffer.new_wrapped(out_bytes)
                 gbuf.pts      = self.frame_pts
-                gbuf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 30)
+                gbuf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 15)
                 self.frame_pts += gbuf.duration
                 self.appsrc.emit('push-buffer', gbuf)
 
@@ -721,20 +805,65 @@ class PoseMonitor:
         return Gst.FlowReturn.OK
 
     # ── GStreamer 管线 ────────────────────────────────────────
-    def build_pipeline(self):
+    def _build_in_pipeline(self):
+        """构建（或重建）输入管线，挂载总线错误监听。"""
         in_str = (
             f'v4l2src device={self.camera} ! '
-            f'image/jpeg,width={self.width},height={self.height} ! '
-            f'mppjpegdec ! video/x-raw,format=NV12 ! '
+            f'video/x-raw,format=NV12,width={self.width},height={self.height},framerate=15/1 ! '
             f'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
         )
-        print(f'Input:  {in_str}')
         self.pipeline = Gst.parse_launch(in_str)
         self.pipeline.get_by_name('sink').connect('new-sample', self.on_new_sample)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_in_error)
+        return in_str
+
+    def _on_in_error(self, bus, message):
+        err, _ = message.parse_error()
+        print(f'[GStreamer] 输入管线错误: {err.message}', flush=True)
+        if not self._pipeline_restarting:
+            self._pipeline_restarting = True
+            GLib.timeout_add(2000, self._restart_in_pipeline)
+
+    def _restart_in_pipeline(self):
+        """在 GLib 主循环中重建输入管线（不影响推流管线）。"""
+        print('[GStreamer] 重建输入管线...', flush=True)
+        try:
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+            # 重置预分配缓冲区（尺寸可能变化）
+            self._out_nv12    = None
+            self._bgr_buf     = None
+            self._panel_cache = None
+            in_str = self._build_in_pipeline()
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self._last_frame_time = time.time()
+            print(f'[GStreamer] 输入管线已恢复: {in_str}', flush=True)
+        except Exception as e:
+            print(f'[GStreamer] 重建失败: {e}，3秒后重试', flush=True)
+            GLib.timeout_add(3000, self._restart_in_pipeline)
+        self._pipeline_restarting = False
+        return False  # 单次触发，不重复
+
+    def _watchdog(self):
+        """每5秒检查一次：若无新帧则重建输入管线。"""
+        if not self._pipeline_restarting:
+            gap = time.time() - self._last_frame_time
+            if gap > 5.0:
+                print(f'[Watchdog] {gap:.0f}s 无新帧，重建输入管线', flush=True)
+                self._pipeline_restarting = True
+                GLib.idle_add(self._restart_in_pipeline)
+        return True  # 持续触发
+
+    def build_pipeline(self):
+        in_str = self._build_in_pipeline()
+        print(f'Input:  {in_str}')
 
         if self.rtsp_url:
             caps = (f'video/x-raw,format=NV12,'
-                    f'width={self.width},height={self.height},framerate=30/1')
+                    f'width={self.width},height={self.height},framerate=15/1')
             out_str = (
                 f'appsrc name=src is-live=true format=time block=false caps={caps} ! '
                 f'mpph264enc ! rtspclientsink protocols=tcp location={self.rtsp_url}'
@@ -748,6 +877,13 @@ class PoseMonitor:
         self.init_csv()
         self.build_pipeline()
 
+        # SIGTERM → 干净退出（防止 MPP 状态残留导致下次重启崩溃）
+        def _on_sigterm(signum, frame):
+            print('[Main] SIGTERM received, stopping...', flush=True)
+            if self.loop and self.loop.is_running():
+                self.loop.quit()
+        signal.signal(signal.SIGTERM, _on_sigterm)
+
         # 启动推理子进程
         self._start_infer_proc()
 
@@ -758,9 +894,11 @@ class PoseMonitor:
         if self.out_pipeline:
             self.out_pipeline.set_state(Gst.State.PLAYING)
         self.pipeline.set_state(Gst.State.PLAYING)
+        self._last_frame_time = time.time()
         print(f'Running. infer_every={self.infer_every}, '
               f'infer_max_rss={self.infer_max_rss}MB')
 
+        GLib.timeout_add(5000, self._watchdog)
         self.loop = GLib.MainLoop()
         try:
             self.loop.run()
@@ -781,7 +919,8 @@ class PoseMonitor:
                 if duration > 1.0:
                     self.log_pose_change(self.current_pose, duration)
 
-            self.pipeline.set_state(Gst.State.NULL)
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
             if self.out_pipeline:
                 self.out_pipeline.set_state(Gst.State.NULL)
             self.csv_file.close()
@@ -810,13 +949,13 @@ if __name__ == '__main__':
     mp.set_start_method('spawn')   # RKNN 需要干净的子进程环境
 
     parser = argparse.ArgumentParser(description='Pose Monitor - Sitting/Standing Detection')
-    parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-rk3588-fp.rknn')
+    parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-320-rk3588-fp.rknn')
     parser.add_argument('--camera', default='/dev/video0')
     parser.add_argument('--log', default='pose_log.csv')
     parser.add_argument('--width',  type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
-    parser.add_argument('--infer-every', type=int, default=3,
-                        help='每 N 帧推理一次 (默认3，约10fps)')
+    parser.add_argument('--infer-every', type=int, default=5,
+                        help='每 N 帧推理一次 (默认5，约3fps@15fps)')
     parser.add_argument('--infer-max-rss', type=int, default=400,
                         help='推理子进程 RSS 阈值 MB，超出则重启子进程 (默认400)')
     parser.add_argument('--sit-remind', type=int, default=30,
