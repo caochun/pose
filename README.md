@@ -348,3 +348,7 @@ RSS 超过 --infer-max-rss 阈值时子进程主动退出并重启，主进程�
 ```bash
 pip install "numpy<2" --force-reinstall
 ```
+
+## 十四、Hermes 微信抓帧命令
+
+用户级 `media_delivery` 插件提供 `/rtsp` 命令，从默认流 `rtsp://localhost:8554/cam` 抓取一帧并发送到微信；也支持 `/rtsp rtsp://其他地址`。插件源码和安装步骤见 [Hermes 集成说明](integrations/hermes/README.md)。

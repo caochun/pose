@@ -1,0 +1,6 @@
+name: media_delivery
+version: "0.3.0"
+description: "Sends local files through Hermes' built-in Weixin adapter"
+author: chun
+provides_hooks:
+  - pre_llm_call
