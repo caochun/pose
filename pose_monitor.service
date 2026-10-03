@@ -1,23 +1,23 @@
 [Unit]
 Description=Pose Monitor - Sitting/Standing Detection
 After=mediamtx.service
-Requires=mediamtx.service
 
 [Service]
-Type=simple
-User=chun
 WorkingDirectory=/home/chun/Develop/pose
 Environment=MALLOC_ARENA_MAX=2
 Environment=RKNN_LOG_LEVEL=0
+Environment=LD_LIBRARY_PATH=/usr/local/lib
+ExecStartPre=/bin/sh -c 'i=0; until nc -z 127.0.0.1 8554 || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done'
 ExecStart=/home/chun/Develop/pose/.venv/bin/python3 -u pose_monitor.py \
-    --model models/yolov8_pose/yolov8n-pose-rk3588-fp.rknn \
+    --model models/yolov8_pose/yolov8n-pose-320-rk3588-fp.rknn \
     --width 1280 \
     --height 720 \
+    --infer-every 15 \
     --stream rtsp://127.0.0.1:8554/cam
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

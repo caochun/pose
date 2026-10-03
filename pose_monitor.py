@@ -27,6 +27,7 @@ import sys
 import threading
 import argparse
 import ctypes
+import glob
 import multiprocessing as mp
 import pathlib
 from datetime import datetime
@@ -85,7 +86,7 @@ KP_LEFT_ANKLE, KP_RIGHT_ANKLE = 15, 16
 
 INPUT_SIZE  = 320
 NMS_THRESH  = 0.45
-CONF_THRESH = 0.35
+CONF_THRESH = 0.60
 
 # ─── 温度（RK3588 thermal zone） ─────────────────────────────────
 _THERMAL = {
@@ -183,9 +184,19 @@ def decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h):
     kp_y   = (kp[:, 1, :] - pad_y) / scale
     kp_v   = sigmoid(kp[:, 2, :])            # (17, M) visibility
 
+    # 最小 bbox：高度至少占画面 10%（过滤噪点）
+    min_h = orig_h * 0.10
+    # 最少可见关键点数：真实人体需要 ≥4 个高置信关键点
+    MIN_KP_VIS = 3
+    KP_VIS_THRESH = 0.4
     M = int(mask.sum())
     boxes = []
     for i in range(M):
+        if (y2[i] - y1[i]) < min_h:
+            continue
+        vis_count = int((kp_v[:, i] > KP_VIS_THRESH).sum())
+        if vis_count < MIN_KP_VIS:
+            continue
         kp_coords = np.stack([kp_x[:, i], kp_y[:, i]], axis=1)  # (17, 2)
         boxes.append([float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]),
                       float(c[i]), kp_coords, kp_v[:, i]])
@@ -327,8 +338,7 @@ def draw_panel(frame, pose, sitting_total, standing_total, stats):
     ] if stats else []
 
     lk, lv, lgap, rk, rv, sep = 54, 90, 10, 54, 90, 10
-    pw = pad + lk + lgap + lv + sep + rk + rv + pad  # == _PANEL_PW
-    ph = pad + max(len(left_rows), len(right_rows)) * lh + pad  # == _PANEL_PH
+    pw, ph = _PANEL_PW, _PANEL_PH
 
     rx, ry = w - pw - 8, _PANEL_RY
 
@@ -386,10 +396,6 @@ def draw_overlay(frame, detections, pose, stats=None):
         if best[6][ki] > 0.3:
             cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255, 0, 0), -1)
 
-
-def draw_detections(frame, detections, pose, sitting_total=0.0, standing_total=0.0, stats=None):
-    draw_panel(frame, pose, sitting_total, standing_total, stats)
-    draw_overlay(frame, detections, pose, stats)
 
 
 def _rss_mb():
@@ -543,6 +549,9 @@ class PoseMonitor:
                  infer_max_rss=400, sit_remind_secs=1800):
         self.model_path    = model_path
         self.camera        = camera
+        self._camera_auto   = camera in (None, '', 'auto')
+        self._camera_path   = None if self._camera_auto else camera
+        self._camera_index  = 0
         self.log_file      = log_file
         self.width         = width
         self.height        = height
@@ -592,6 +601,8 @@ class PoseMonitor:
         self.appsrc      = None
         self.loop        = None
         self.push_fail   = 0   # appsrc push-buffer 失败计数
+        self._input_candidate = 0
+        self._input_format = None
 
         # 输入管线自动恢复
         self._last_frame_time    = time.time()
@@ -805,18 +816,90 @@ class PoseMonitor:
         return Gst.FlowReturn.OK
 
     # ── GStreamer 管线 ────────────────────────────────────────
-    def _build_in_pipeline(self):
-        """构建（或重建）输入管线，挂载总线错误监听。"""
-        in_str = (
-            f'v4l2src device={self.camera} ! '
-            f'video/x-raw,format=NV12,width={self.width},height={self.height},framerate=15/1 ! '
-            f'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
+    def _camera_candidates(self):
+        """Find capture nodes, preferring stable udev links over /dev/videoN."""
+        if not self._camera_auto:
+            return [self.camera]
+
+        candidates = []
+        for pattern in (
+            '/dev/v4l/by-id/*-video-index0',
+            '/dev/v4l/by-path/*-video-index0',
+        ):
+            candidates.extend(sorted(glob.glob(pattern)))
+
+        # Some systems do not create /dev/v4l/by-id. The index0 links above
+        # normally exclude metadata nodes; this is only the fallback.
+        if not candidates:
+            candidates = sorted(glob.glob('/dev/video[0-9]*'))
+
+        unique = []
+        targets = set()
+        for path in candidates:
+            target = os.path.realpath(path)
+            if path not in unique and target not in targets and os.path.exists(path):
+                unique.append(path)
+                targets.add(target)
+        return unique
+
+    def _select_camera(self):
+        candidates = self._camera_candidates()
+        if not candidates:
+            raise RuntimeError('未发现可用的 USB 摄像头设备节点')
+
+        if self._camera_path in candidates:
+            return self._camera_path
+
+        self._camera_index %= len(candidates)
+        self._camera_path = candidates[self._camera_index]
+        print(f'[Camera] 自动选择设备: {self._camera_path}', flush=True)
+        return self._camera_path
+
+    def _advance_camera(self):
+        """Move to the next discovered camera after all formats fail."""
+        if not self._camera_auto:
+            return
+        candidates = self._camera_candidates()
+        if self._camera_path in candidates:
+            self._camera_index = (candidates.index(self._camera_path) + 1) % len(candidates)
+        else:
+            self._camera_index = 0
+        self._camera_path = None
+
+    def _input_pipeline_specs(self):
+        """Return input variants, all normalized to NV12 at the output."""
+        source = f'v4l2src device={self._select_camera()}'
+        caps = f'width={self.width},height={self.height}'
+        output = (
+            f'videorate ! video/x-raw,format=NV12,{caps},framerate=15/1 ! '
+            'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
         )
+        return [
+            (
+                'NV12',
+                f'{source} ! video/x-raw,format=NV12,{caps} ! {output}',
+            ),
+            (
+                'MJPG',
+                f'{source} ! image/jpeg,{caps} ! jpegdec ! videoconvert ! {output}',
+            ),
+            (
+                'YUY2',
+                f'{source} ! video/x-raw,format=YUY2,{caps} ! videoconvert ! {output}',
+            ),
+        ]
+
+    def _build_in_pipeline(self):
+        """Build an input pipeline and normalize camera frames to NV12."""
+        specs = self._input_pipeline_specs()
+        self._input_candidate %= len(specs)
+        self._input_format, in_str = specs[self._input_candidate]
         self.pipeline = Gst.parse_launch(in_str)
         self.pipeline.get_by_name('sink').connect('new-sample', self.on_new_sample)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect('message::error', self._on_in_error)
+        print(f'[GStreamer] 输入格式候选: {self._input_format}', flush=True)
         return in_str
 
     def _on_in_error(self, bus, message):
@@ -830,13 +913,20 @@ class PoseMonitor:
         """在 GLib 主循环中重建输入管线（不影响推流管线）。"""
         print('[GStreamer] 重建输入管线...', flush=True)
         try:
-            self.pipeline.get_bus().remove_signal_watch()
-            self.pipeline.set_state(Gst.State.NULL)
+            if self.pipeline is not None:
+                self.pipeline.get_bus().remove_signal_watch()
+                self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
             # 重置预分配缓冲区（尺寸可能变化）
             self._out_nv12    = None
             self._bgr_buf     = None
             self._panel_cache = None
+            self._input_candidate = (
+                self._input_candidate + 1
+            )
+            if self._input_candidate >= 3:
+                self._input_candidate = 0
+                self._advance_camera()
             in_str = self._build_in_pipeline()
             self.pipeline.set_state(Gst.State.PLAYING)
             self._last_frame_time = time.time()
@@ -950,7 +1040,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Pose Monitor - Sitting/Standing Detection')
     parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-320-rk3588-fp.rknn')
-    parser.add_argument('--camera', default='/dev/video0')
+    parser.add_argument('--camera', default='auto',
+                        help='摄像头设备路径；默认 auto 自动发现 USB 摄像头')
     parser.add_argument('--log', default='pose_log.csv')
     parser.add_argument('--width',  type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
