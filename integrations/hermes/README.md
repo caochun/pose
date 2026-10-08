@@ -13,6 +13,26 @@ Hermes' built-in Weixin adapter.
 
 ## Install or update
 
+Hermes v0.21.5 only dispatches built-in slash commands while a conversation is
+busy. The included generic patch adds `busy_policy="dispatch"` to plugin command
+registration and routes plugin commands through both busy-session guards. Other
+plugins default to an explicit busy rejection. Authorization and session context
+binding still run before the handler.
+
+Apply the patch once to the Hermes checkout used by the gateway:
+
+```bash
+hermes_repo=/home/chun/Develop/hermes-agent-v2026.9.24
+patch_file="$PWD/integrations/hermes/patches/plugin-busy-dispatch.patch"
+git -C "$hermes_repo" apply --check "$patch_file"
+git -C "$hermes_repo" apply "$patch_file"
+```
+
+After an upgrade, check whether Hermes includes this fix or reapply the patch.
+`git -C "$hermes_repo" apply --reverse --check "$patch_file"` succeeds when this
+exact patch is already applied. The plugin still loads without the patch, but
+logs a warning and cannot run immediately during an active conversation.
+
 From the root of this repository, install the two source files into the
 user plugin directory, then restart the gateway:
 
@@ -32,11 +52,27 @@ in this repository.
 ## Usage
 
 Send `/rtsp` in the Weixin conversation to capture and send one JPEG frame.
-The command reads the stream over TCP, allows up to 15 seconds for capture,
-and deletes the temporary image after the send attempt.
+The command reads the stream over TCP, allows up to 15 seconds for capture and
+30 seconds for image delivery, and reports which stage failed. A delivery timeout
+means receipt was not confirmed; it does not prove the image was not delivered.
+Duplicate requests in the same chat receive an in-progress notice. Temporary
+images and capture processes are cleaned up on completion, timeout, or cancellation.
+
+The plugin logs capture, upload completion, and failures with a request ID and
+elapsed time in the gateway logs, without logging RTSP URLs or credentials.
 
 Use `/rtsp rtsp://host:8554/path` for another stream. To change the default,
 set `HERMES_RTSP_URL` in the gateway's environment and restart it.
 
-The plugin reads the existing RTSP stream; installation requires no changes
-to MediaMTX or Hermes core files.
+The plugin reads the existing RTSP stream and requires no MediaMTX configuration
+changes. The only Hermes core changes are the generic busy-command dispatch patch.
+
+## Verification
+
+The regression tests cover both busy-session guards, authorization, current-chat
+routing, duplicate requests, stalled uploads, cancellation, and process cleanup.
+They use isolated Hermes homes and never send real Weixin messages:
+
+```bash
+PYTHONPATH="$hermes_repo" "$hermes_repo/.venv/bin/python" -m unittest discover -s integrations/hermes/tests -v
+```

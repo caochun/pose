@@ -10,16 +10,22 @@ and stored in a module-level variable. The tool reads it when invoked.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import json
 import os
 import tempfile
+import time
+import uuid
+from contextlib import suppress
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _last_sender_id: list[str] = [""]  # updated each turn by pre_llm_call
 DEFAULT_RTSP_URL = "rtsp://localhost:8554/cam"
+CAPTURE_TIMEOUT = 15
+SEND_TIMEOUT = 30
 
 
 def _weixin_credentials() -> tuple[dict[str, str], str | None]:
@@ -69,6 +75,7 @@ DELIVER_SCHEMA = {
 
 
 def register(ctx) -> None:
+    rtsp_in_flight: set[str] = set()
 
     def pre_llm_call(sender_id: str = "", **kwargs):
         if sender_id:
@@ -113,32 +120,38 @@ def register(ctx) -> None:
 
     async def handle_rtsp(raw_args: str = "") -> str:
         """Capture one RTSP frame and send it to the current Weixin chat."""
-        try:
-            from gateway.session_context import get_session_env
+        from gateway.session_context import get_session_env
 
-            platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
-            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
-        except Exception:
-            platform = ""
-            chat_id = ""
-
-        if platform and platform != "weixin":
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        if platform != "weixin":
             return "RTSP capture is currently supported through Weixin only."
-
-        chat_id = chat_id or _last_sender_id[0] or os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
         if not chat_id:
             return "RTSP capture failed: no Weixin chat target."
+        if chat_id in rtsp_in_flight:
+            return "An RTSP snapshot is already being captured or sent. Please wait for its result."
 
         rtsp_url = raw_args.strip() or os.getenv("HERMES_RTSP_URL", DEFAULT_RTSP_URL).strip()
         if not rtsp_url.startswith(("rtsp://", "rtsps://")):
             return "RTSP capture failed: URL must start with rtsp:// or rtsps://."
 
-        fd, frame_path = tempfile.mkstemp(suffix=".jpg", prefix="rtsp_frame_")
-        os.close(fd)
+        request_id = uuid.uuid4().hex[:8]
+        started = time.monotonic()
+        process = None
+        frame_path = None
+        stage = "capture"
+        rtsp_in_flight.add(chat_id)
+        logger.info("rtsp[%s] capture started", request_id)
         try:
+            fd, frame_path = tempfile.mkstemp(suffix=".jpg", prefix="rtsp_frame_")
+            os.close(fd)
             try:
                 process = await asyncio.create_subprocess_exec(
                     "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
                     "-y",
                     "-rtsp_transport",
                     "tcp",
@@ -149,50 +162,69 @@ def register(ctx) -> None:
                     "-q:v",
                     "3",
                     frame_path,
-                    "-loglevel",
-                    "error",
-                    stdout=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
             except FileNotFoundError:
+                logger.warning("rtsp[%s] ffmpeg not installed", request_id)
                 return "RTSP capture failed: ffmpeg is not installed."
 
             try:
-                _, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+                _, stderr = await asyncio.wait_for(process.communicate(), timeout=CAPTURE_TIMEOUT)
             except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                return "RTSP capture failed: timed out after 15s."
+                logger.warning("rtsp[%s] capture timed out after %ss", request_id, CAPTURE_TIMEOUT)
+                return f"RTSP capture timed out after {CAPTURE_TIMEOUT}s. Check the camera stream."
 
             if process.returncode != 0:
                 lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
-                detail = (lines[-1] if lines else "unknown error")[:200]
+                detail = (lines[-1] if lines else "unknown error").replace(rtsp_url, "[RTSP stream]")[:200]
+                logger.warning("rtsp[%s] ffmpeg exited with code %s", request_id, process.returncode)
                 return f"RTSP capture failed: {detail}"
 
             if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+                logger.warning("rtsp[%s] capture produced an empty frame", request_id)
                 return "RTSP capture failed: empty frame."
 
             from gateway.platforms.weixin import send_weixin_direct
 
             extra, token = _weixin_credentials()
-            result = await send_weixin_direct(
-                extra=extra,
-                token=token,
-                chat_id=chat_id,
-                message="",
-                media_files=[(frame_path, False)],
-            )
+            stage = "send"
+            logger.info("rtsp[%s] captured %s bytes in %.1fs; sending image", request_id,
+                        os.path.getsize(frame_path), time.monotonic() - started)
+            try:
+                result = await asyncio.wait_for(
+                    send_weixin_direct(
+                        extra=extra, token=token, chat_id=chat_id, message="",
+                        media_files=[(frame_path, False)],
+                    ),
+                    timeout=SEND_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("rtsp[%s] Weixin send timed out after %ss", request_id, SEND_TIMEOUT)
+                return (f"RTSP frame captured, but Weixin delivery was not confirmed within {SEND_TIMEOUT}s. "
+                        "If no image arrives, try /rtsp again.")
             if result.get("success"):
+                logger.info("rtsp[%s] image sent in %.1fs", request_id, time.monotonic() - started)
                 return ""
+            logger.warning("rtsp[%s] Weixin rejected image delivery", request_id)
             return f"RTSP capture succeeded but Weixin send failed: {result.get('error')}"
+        except asyncio.CancelledError:
+            logger.info("rtsp[%s] cancelled during %s", request_id, stage)
+            raise
         except Exception as exc:
-            logger.exception("rtsp capture failed")
-            return f"RTSP capture failed: {exc}"
+            logger.warning("rtsp[%s] %s failed: %s", request_id, stage, type(exc).__name__)
+            return f"RTSP {stage} failed: {type(exc).__name__}. Please try again."
         finally:
             try:
-                os.unlink(frame_path)
-            except OSError:
-                pass
+                if process is not None and process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    await process.communicate()
+            finally:
+                if frame_path:
+                    with suppress(OSError):
+                        os.unlink(frame_path)
+                rtsp_in_flight.discard(chat_id)
 
     ctx.register_tool(
         name="deliver_file",
@@ -201,9 +233,15 @@ def register(ctx) -> None:
         handler=handle_deliver_file,
         is_async=True,
     )
+    command_options = {}
+    if "busy_policy" in inspect.signature(ctx.register_command).parameters:
+        command_options["busy_policy"] = "dispatch"
+    else:
+        logger.warning("rtsp: Hermes needs the plugin busy-dispatch patch to handle commands during agent turns")
     ctx.register_command(
         "rtsp",
         handler=handle_rtsp,
         description="Capture one frame from the local RTSP camera and send it via Weixin.",
         args_hint="[RTSP_URL]",
+        **command_options,
     )

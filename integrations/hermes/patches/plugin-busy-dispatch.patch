@@ -1,0 +1,75 @@
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 48d793d..c038b71 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -596,6 +596,21 @@ class GatewayInboundMixin:
+             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
+             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
+ 
++        if _evt_cmd:
++            from hermes_cli.plugins import get_plugin_commands
++            plugin_name = _evt_cmd.replace("_", "-")
++            plugin_command = get_plugin_commands().get(plugin_name)
++            if plugin_command:
++                _denied = self._check_slash_access(source, plugin_name)
++                if _denied is not None:
++                    return True, _denied
++                if plugin_command.get("busy_policy", "reject") == "dispatch":
++                    handled, result, _ = await self._hm_dispatch_quick_and_plugin_commands(
++                        event, source, plugin_name)
++                    if handled:
++                        return True, result
++                return True, f"Agent is running; /{plugin_name} cannot run mid-turn. Wait or use /stop first."
++
+         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
+         # photo-only follow-up; adapter-level batching absorbs them.
+         if event.message_type == MessageType.PHOTO:
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index cfe1d07..16f36ff 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -435,7 +435,12 @@ def should_bypass_active_session(command_name: str | None) -> bool:
+ 
+     See #10370, #4665, #5057, #6252.
+     """
+-    return resolve_command(command_name) is not None if command_name else False
++    if not command_name:
++        return False
++    if resolve_command(command_name) is not None:
++        return True
++    from hermes_cli.plugins import get_plugin_command_handler
++    return get_plugin_command_handler(command_name.lstrip("/").replace("_", "-")) is not None
+ 
+ 
+ def _resolve_config_gates() -> set[str]:
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 274deb1..64e5d61 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -658,11 +658,16 @@ class PluginContext:
+     @_serialized_replacement
+     def register_command(
+         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
+-        argument_mode: str | None = None,
++        argument_mode: str | None = None, busy_policy: str = "reject",
+     ) -> Optional[PluginRegistration]:
+         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
+         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
+-        field; without it the command registers parameterless there but still accepts trailing text."""
++        field; without it the command registers parameterless there but still accepts trailing text.
++        ``busy_policy='dispatch'`` opts a command into running alongside a gateway agent turn;
++        the default ``reject`` returns a busy notice without queueing the command as user input.
++        """
++        if busy_policy not in {"reject", "dispatch"}:
++            raise ValueError("Plugin command busy_policy must be 'reject' or 'dispatch'")
+         clean = name.lower().strip().lstrip("/").replace(" ", "-")
+         if not clean:
+             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
+@@ -677,6 +682,7 @@ class PluginContext:
+         entry = {
+             "handler": handler, "description": description or "Plugin command",
+             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
++            "busy_policy": busy_policy,
+             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+             else ("text" if hint else None),
+         }
