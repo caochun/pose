@@ -31,6 +31,7 @@ import glob
 import multiprocessing as mp
 import pathlib
 from datetime import datetime
+from person_events import PersonEventManager
 
 # ─── RGA 硬件色彩转换（可选，需要 rga_cvt.so + librga） ────────────────
 def _load_rga():
@@ -84,7 +85,8 @@ KP_LEFT_HIP, KP_RIGHT_HIP = 11, 12
 KP_LEFT_KNEE, KP_RIGHT_KNEE = 13, 14
 KP_LEFT_ANKLE, KP_RIGHT_ANKLE = 15, 16
 
-INPUT_SIZE  = 320
+INPUT_SIZE  = 640
+CAMERA_FPS  = 5
 NMS_THRESH  = 0.45
 CONF_THRESH = 0.60
 
@@ -156,57 +158,113 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
 
 
+def _softmax(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+
+def _nms_pose(boxes, scores, iou_thresh):
+    if not boxes:
+        return []
+    order = np.asarray(scores, dtype=np.float32).argsort()[::-1]
+    arr = np.asarray(boxes, dtype=np.float32)
+    x1, y1, x2, y2 = arr.T
+    areas = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    keep = []
+    while order.size:
+        i = int(order[0]); keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(x1[i], x1[rest]); yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest]); yy2 = np.minimum(y2[i], y2[rest])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        union = areas[i] + areas[rest] - inter
+        iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+        order = rest[iou <= iou_thresh]
+    return keep
+
+
+def _decode_rk3576_branch(box_output, keypoint_output, grid_w, grid_h, stride,
+                          global_offset, object_threshold):
+    scores = sigmoid(box_output[0, 64, :])
+    indices = np.flatnonzero(scores >= object_threshold)
+    if indices.size == 0:
+        return []
+    # np.take keeps the channel/anchor axes explicit. Direct advanced indexing
+    # can return (64, N) or (N, 64) depending on the array layout, which
+    # silently scrambles the four DFL box distributions.
+    selected = np.take(box_output[0, :64, :], indices, axis=1).T
+    dfl = selected.reshape(-1, 4, 16)
+    dfl = _softmax(dfl, axis=2)
+    offsets = np.sum(dfl * np.arange(16, dtype=np.float32).reshape(1, 1, 16), axis=2)
+    rows = indices // grid_w
+    cols = indices - rows * grid_w
+    cx = cols.astype(np.float32) + 0.5
+    cy = rows.astype(np.float32) + 0.5
+    boxes = np.column_stack(((cx - offsets[:, 0]) * stride,
+                             (cy - offsets[:, 1]) * stride,
+                             (cx + offsets[:, 2]) * stride,
+                             (cy + offsets[:, 3]) * stride))
+    global_indices = global_offset + indices
+    kp = np.take(keypoint_output[0], global_indices, axis=-1)
+    kp = np.moveaxis(kp, -1, 0).astype(np.float32, copy=False)
+    kp = np.nan_to_num(kp, nan=0.0, posinf=0.0, neginf=0.0)
+    kp[..., 2] = np.clip(kp[..., 2], 0.0, 1.0)
+    return [(float(scores[idx]), tuple(float(v) for v in box), kpt.copy())
+            for idx, (box, kpt) in zip(indices, zip(boxes, kp))]
+
+
 def decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h):
-    """
-    单输出格式 (1, 56, N)：
-      [0:4, :]  — (x1, y1, x2, y2) 已解码，模型输入坐标（INPUT_SIZE 空间）
-      [4,   :]  — 置信度 logit，需 sigmoid
-      [5::3, :] / [6::3, :] / [7::3, :] — 17 关键点的 x / y / visibility logit
-    """
-    o = outputs[0][0]          # (56, N)
-    conf = sigmoid(o[4])       # (N,)
+    """Decode either legacy 320px single-output or RK3576 640px export."""
+    if len(outputs) == 4:
+        prepared = [np.asarray(x) for x in outputs]
+        for i, x in enumerate(prepared[:3]):
+            if x.ndim == 4 and x.shape[2] == x.shape[3]:
+                prepared[i] = x.reshape(x.shape[0], x.shape[1], -1)
+        detections = []
+        detections += _decode_rk3576_branch(prepared[0], prepared[3], 80, 80, 8, 0, CONF_THRESH)
+        detections += _decode_rk3576_branch(prepared[1], prepared[3], 40, 40, 16, 6400, CONF_THRESH)
+        detections += _decode_rk3576_branch(prepared[2], prepared[3], 20, 20, 32, 8000, CONF_THRESH)
+        keep = _nms_pose([d[1] for d in detections], [d[0] for d in detections], NMS_THRESH)
+        result = []
+        min_h = orig_h * 0.10
+        for i in keep:
+            score, box, kp = detections[i]
+            x1, y1, x2, y2 = box
+            x1 = np.clip((x1 - pad_x) / scale, 0, orig_w)
+            y1 = np.clip((y1 - pad_y) / scale, 0, orig_h)
+            x2 = np.clip((x2 - pad_x) / scale, 0, orig_w)
+            y2 = np.clip((y2 - pad_y) / scale, 0, orig_h)
+            kp_coords = np.empty((17, 2), dtype=np.float32)
+            kp_coords[:, 0] = np.clip((kp[:, 0] - pad_x) / scale, 0, orig_w)
+            kp_coords[:, 1] = np.clip((kp[:, 1] - pad_y) / scale, 0, orig_h)
+            kp_conf = kp[:, 2]
+            if (y2 - y1) < min_h or int(np.count_nonzero(kp_conf > 0.4)) < 3:
+                continue
+            result.append([float(x1), float(y1), float(x2), float(y2), float(score), kp_coords, kp_conf])
+        return result
+
+    o = outputs[0][0]
+    conf = sigmoid(o[4])
     mask = conf >= CONF_THRESH
     if not mask.any():
         return []
-
-    # bbox 为 (cx, cy, w, h) 格式，先转换为 xyxy，再映射回原图坐标
-    cx = o[0, mask]; cy = o[1, mask]; bw = o[2, mask]; bh_box = o[3, mask]
+    cx, cy, bw, bh_box = o[0, mask], o[1, mask], o[2, mask], o[3, mask]
     x1 = np.clip((cx - bw / 2 - pad_x) / scale, 0, orig_w)
     y1 = np.clip((cy - bh_box / 2 - pad_y) / scale, 0, orig_h)
     x2 = np.clip((cx + bw / 2 - pad_x) / scale, 0, orig_w)
     y2 = np.clip((cy + bh_box / 2 - pad_y) / scale, 0, orig_h)
-    c  = conf[mask]
-
-    # 关键点：(17, 3, N) → 每关键点 (x, y, vis_logit)
-    kp_raw = o[5:, mask]              # (51, M)
-    kp     = kp_raw.reshape(17, 3, -1) # (17, 3, M)
-    kp_x   = (kp[:, 0, :] - pad_x) / scale  # (17, M) 原图坐标
-    kp_y   = (kp[:, 1, :] - pad_y) / scale
-    kp_v   = sigmoid(kp[:, 2, :])            # (17, M) visibility
-
-    # 最小 bbox：高度至少占画面 10%（过滤噪点）
-    min_h = orig_h * 0.10
-    # 最少可见关键点数：真实人体需要 ≥4 个高置信关键点
-    MIN_KP_VIS = 3
-    KP_VIS_THRESH = 0.4
-    M = int(mask.sum())
+    kp = o[5:, mask].reshape(17, 3, -1)
+    kp_coords = np.stack([(kp[:, 0, :] - pad_x) / scale, (kp[:, 1, :] - pad_y) / scale], axis=2)
+    kp_conf = sigmoid(kp[:, 2, :]).T
     boxes = []
-    for i in range(M):
-        if (y2[i] - y1[i]) < min_h:
+    for i in range(int(mask.sum())):
+        if (y2[i] - y1[i]) < orig_h * 0.10 or int((kp_conf[i] > 0.4).sum()) < 3:
             continue
-        vis_count = int((kp_v[:, i] > KP_VIS_THRESH).sum())
-        if vis_count < MIN_KP_VIS:
-            continue
-        kp_coords = np.stack([kp_x[:, i], kp_y[:, i]], axis=1)  # (17, 2)
-        boxes.append([float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]),
-                      float(c[i]), kp_coords, kp_v[:, i]])
-
-    scores  = np.array([b[4] for b in boxes])
-    indices = cv2.dnn.NMSBoxes(
-        [[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in boxes],
-        scores.tolist(), CONF_THRESH, NMS_THRESH)
-    return [boxes[i] for i in indices.flatten()] if len(indices) else []
-
+        boxes.append([float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]), float(conf[mask][i]), kp_coords[i], kp_conf[i]])
+    return [boxes[i] for i in _nms_pose([b[:4] for b in boxes], [b[4] for b in boxes], NMS_THRESH)]
 
 def classify_pose(kp_coords, kp_confs, box):
     MIN_CONF = 0.3
@@ -368,7 +426,7 @@ def draw_panel(frame, pose, sitting_total, standing_total, stats):
             cv2.putText(frame, val, (x0 + rk, y), font, 0.60, col, 1, cv2.LINE_AA)
 
 
-def draw_overlay(frame, detections, pose, stats=None):
+def draw_overlay(frame, detections, pose, stats=None, labels=None):
     """久坐提醒横幅 + 检测框 + 关键点。每帧调用，开销低。"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     h, w = frame.shape[:2]
@@ -387,14 +445,21 @@ def draw_overlay(frame, detections, pose, stats=None):
 
     if not detections:
         return
-    best  = max(detections, key=lambda d: d[4])
-    x1, y1, x2, y2 = int(best[0]), int(best[1]), int(best[2]), int(best[3])
-    color = (0,255,0) if pose=='standing' else (0,165,255) if pose=='sitting' else (128,128,128)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, pose, (x1, y1 - 10), font, 0.8, color, 2)
-    for ki in range(17):
-        if best[6][ki] > 0.3:
-            cv2.circle(frame, (int(best[5][ki][0]), int(best[5][ki][1])), 4, (255, 0, 0), -1)
+    for idx, det in enumerate(detections):
+        x1, y1, x2, y2 = map(int, det[:4])
+        label_pose = pose
+        label_id = None
+        if labels and idx < len(labels):
+            _track_id, profile_id, label_pose = labels[idx]
+            label_id = profile_id
+        color = ((0,255,0) if label_pose == 'standing' else
+                 (0,165,255) if label_pose == 'sitting' else (128,128,128))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        text = f'P{label_id} {label_pose}' if label_id is not None else label_pose
+        cv2.putText(frame, text, (x1, max(20, y1 - 10)), font, 0.7, color, 2)
+        for ki in range(17):
+            if det[6][ki] > 0.3:
+                cv2.circle(frame, (int(det[5][ki][0]), int(det[5][ki][1])), 4, (255, 0, 0), -1)
 
 
 
@@ -453,11 +518,9 @@ def _inference_process(model_path, frame_queue, result_queue,
         nv12 = np.frombuffer(nv12_bytes, dtype=np.uint8).reshape(orig_h * 3 // 2, orig_w)
 
         try:
-            if _RGA_OK:
-                bgr = np.ascontiguousarray(np.empty((orig_h, orig_w, 3), dtype=np.uint8))
-                _rga_nv12_to_bgr(nv12, bgr, orig_w, orig_h)
-            else:
-                bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            # RK3576 RGA is shared with the main overlay path; concurrent RGA calls
+            # can block, so inference deliberately uses the software conversion.
+            bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
             inp, scale, pad_x, pad_y = letterbox(bgr, INPUT_SIZE)
             inp_rgb = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             _t0 = time.time()
@@ -546,7 +609,9 @@ def _inference_process(model_path, frame_queue, result_queue,
 class PoseMonitor:
     def __init__(self, model_path, camera='/dev/video0', log_file='pose_log.csv',
                  width=1280, height=720, rtsp_url=None, infer_every=3,
-                 infer_max_rss=400, sit_remind_secs=1800):
+                 infer_max_rss=400, sit_remind_secs=1800,
+                 profile_db='person_profiles.sqlite3', event_media='event_media',
+                 weixin_target='weixin'):
         self.model_path    = model_path
         self.camera        = camera
         self._camera_auto   = camera in (None, '', 'auto')
@@ -559,6 +624,14 @@ class PoseMonitor:
         self.infer_every   = infer_every
         self.infer_max_rss = infer_max_rss
         self.sit_remind_secs = sit_remind_secs
+        self.profile_db = profile_db
+        self.event_media = event_media
+        self.weixin_target = weixin_target
+        self.events = PersonEventManager(profile_db, event_media)
+        if weixin_target != 'weixin':
+            self.events.notifier.close()
+            from person_events import WeixinNotifier
+            self.events.notifier = WeixinNotifier(weixin_target)
 
         # 姿态状态
         self.current_pose    = None
@@ -582,6 +655,8 @@ class PoseMonitor:
         self.last_pose        = 'unknown'
         self.last_infer_stats = {}
         self.last_detections  = []
+        self._result_seq      = 0
+        self._event_seq       = -1
         self.frame_count      = 0
         self.frame_pts        = 0
 
@@ -714,6 +789,7 @@ class PoseMonitor:
             self.last_pose        = pose
             self.last_infer_stats = infer_stats
             self.last_detections  = det_serial
+            self._result_seq += 1
             self.update_state(pose)
 
     # ── GStreamer 回调（主进程，15fps）────────────────────────
@@ -776,6 +852,20 @@ class PoseMonitor:
                 else:
                     bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
 
+                pending_events = []
+                # 每个新的推理结果只处理一次。先在原始 BGR 上计算所有人物
+                # 特征，之后再绘制面板和标签，避免覆盖画面污染外观特征。
+                if self._result_seq != self._event_seq:
+                    self._event_seq = self._result_seq
+                    # The inference worker emits empty stats on an exception.
+                    # A failed inference is not evidence of a missing person.
+                    if self.last_infer_stats:
+                        pending_events = self.events.process(
+                            bgr, self.last_detections, self.last_pose)
+
+                self.events.publish_status(
+                    self._fps_val, self.last_infer_stats.get("fps", 0.0), now)
+
                 # 面板：每 _PANEL_EVERY 帧重绘，其余帧贴缓存
                 self._panel_count += 1
                 rx = w - _PANEL_PW - 8
@@ -785,8 +875,11 @@ class PoseMonitor:
                                             rx:rx+_PANEL_PW].copy()
                 else:
                     bgr[_PANEL_RY:_PANEL_RY+_PANEL_PH, rx:rx+_PANEL_PW] = self._panel_cache
-                # 检测框 + 久坐提醒：每帧绘制（开销低）
-                draw_overlay(bgr, self.last_detections, self.last_pose, stats)
+                # 检测框 + 久坐提醒：每帧绘制（现在绘制所有人物）
+                draw_overlay(bgr, self.last_detections, self.last_pose, stats,
+                             self.events.labels)
+                if pending_events:
+                    self.events.emit(pending_events, bgr)
 
                 # BGR → NV12
                 if _RGA_OK:
@@ -806,7 +899,7 @@ class PoseMonitor:
                 out_bytes = self._out_nv12.tobytes()
                 gbuf = Gst.Buffer.new_wrapped(out_bytes)
                 gbuf.pts      = self.frame_pts
-                gbuf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 15)
+                gbuf.duration = Gst.util_uint64_scale(1, Gst.SECOND, CAMERA_FPS)
                 self.frame_pts += gbuf.duration
                 self.appsrc.emit('push-buffer', gbuf)
 
@@ -871,7 +964,7 @@ class PoseMonitor:
         source = f'v4l2src device={self._select_camera()}'
         caps = f'width={self.width},height={self.height}'
         output = (
-            f'videorate ! video/x-raw,format=NV12,{caps},framerate=15/1 ! '
+            f'videorate ! video/x-raw,format=NV12,{caps},framerate={CAMERA_FPS}/1 ! '
             'appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false'
         )
         return [
@@ -953,7 +1046,7 @@ class PoseMonitor:
 
         if self.rtsp_url:
             caps = (f'video/x-raw,format=NV12,'
-                    f'width={self.width},height={self.height},framerate=15/1')
+                    f'width={self.width},height={self.height},framerate={CAMERA_FPS}/1')
             out_str = (
                 f'appsrc name=src is-live=true format=time block=false caps={caps} ! '
                 f'mpph264enc ! rtspclientsink protocols=tcp location={self.rtsp_url}'
@@ -1014,6 +1107,7 @@ class PoseMonitor:
             if self.out_pipeline:
                 self.out_pipeline.set_state(Gst.State.NULL)
             self.csv_file.close()
+            self.events.close()
 
             # 结算离座
             if self.away_start_time:
@@ -1039,19 +1133,25 @@ if __name__ == '__main__':
     mp.set_start_method('spawn')   # RKNN 需要干净的子进程环境
 
     parser = argparse.ArgumentParser(description='Pose Monitor - Sitting/Standing Detection')
-    parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-320-rk3588-fp.rknn')
+    parser.add_argument('--model', default='models/yolov8_pose/yolov8n-pose-640-rk3576-i8.rknn')
     parser.add_argument('--camera', default='auto',
                         help='摄像头设备路径；默认 auto 自动发现 USB 摄像头')
     parser.add_argument('--log', default='pose_log.csv')
     parser.add_argument('--width',  type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--infer-every', type=int, default=5,
-                        help='每 N 帧推理一次 (默认5，约3fps@15fps)')
+                        help='每 N 帧推理一次 (默认5，配合5fps摄像头约1fps)')
     parser.add_argument('--infer-max-rss', type=int, default=400,
                         help='推理子进程 RSS 阈值 MB，超出则重启子进程 (默认400)')
     parser.add_argument('--sit-remind', type=int, default=30,
                         help='连续坐超过 N 分钟显示久坐提醒 (默认30)')
     parser.add_argument('--stream', default=None, metavar='RTSP_URL')
+    parser.add_argument('--profile-db', default='person_profiles.sqlite3',
+                        help='人物档案 SQLite 文件')
+    parser.add_argument('--event-media', default='event_media',
+                        help='微信事件截图目录')
+    parser.add_argument('--weixin-target', default='weixin',
+                        help='Hermes 发送目标，默认 weixin')
     args = parser.parse_args()
 
     monitor = PoseMonitor(
@@ -1064,5 +1164,8 @@ if __name__ == '__main__':
         infer_every     = args.infer_every,
         infer_max_rss   = args.infer_max_rss,
         sit_remind_secs = args.sit_remind * 60,
+        profile_db      = args.profile_db,
+        event_media     = args.event_media,
+        weixin_target   = args.weixin_target,
     )
     monitor.run()

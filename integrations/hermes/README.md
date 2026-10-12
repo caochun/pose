@@ -4,6 +4,11 @@ The `media_delivery` user plugin provides `/rtsp` and the `deliver_file`
 tool. It is tested with Hermes v0.21.5 (release v2026.9.24) and uses
 Hermes' built-in Weixin adapter.
 
+The `pose_queries` plugin adds `/人物`, `/命名`, `/今天`, `/截图`, `/状态`,
+`/视频`, `/看看`, and `/变化`. It reads the pose monitor's local records and
+uses the configured DeepSeek Flash API for picture observations. Chinese usage
+and storage limits are documented in [WEIXIN_COMMANDS.md](../../WEIXIN_COMMANDS.md).
+
 ## Requirements
 
 - A Hermes gateway with Weixin already configured and logged in.
@@ -49,6 +54,24 @@ The gateway uses existing Weixin credentials from its environment or the
 account file saved by QR login. Credentials and account files are not included
 in this repository.
 
+For the RK3576 deployment at `192.168.30.192`, also install `pose_queries`
+into Hermes and into the event worker's source directory, from the repository
+root on that device:
+
+```bash
+plugin_dir=/root/.hermes/plugins/pose_queries
+event_plugin_dir=/root/Develop/pose/hermes_plugins/pose_queries
+install -d "$plugin_dir" "$event_plugin_dir"
+install -m 644 integrations/hermes/pose_queries/__init__.py integrations/hermes/pose_queries/vision.py integrations/hermes/pose_queries/labels.py integrations/hermes/pose_queries/plugin.yaml "$plugin_dir/"
+install -m 644 integrations/hermes/pose_queries/__init__.py integrations/hermes/pose_queries/vision.py integrations/hermes/pose_queries/labels.py integrations/hermes/pose_queries/plugin.yaml "$event_plugin_dir/"
+```
+
+Keep both `media_delivery` and `pose_queries` in the `plugins.enabled` list
+in `/root/.hermes/config.yaml`, then restart `hermes-gateway.service`. The pose
+service needs this repository's `person_events.py` alongside `pose_monitor.py`.
+The event worker uses `/root/.hermes/venvs/hermes/bin/python` (overridable with
+`HERMES_PYTHON`). Its paths currently target this root-owned device deployment.
+
 ## Usage
 
 Send `/rtsp` in the Weixin conversation to capture and send one JPEG frame.
@@ -75,4 +98,10 @@ They use isolated Hermes homes and never send real Weixin messages:
 
 ```bash
 PYTHONPATH="$hermes_repo" "$hermes_repo/.venv/bin/python" -m unittest discover -s integrations/hermes/tests -v
+```
+
+Profile naming tests can also run without Hermes or network access:
+
+```bash
+python3 -m unittest discover -s integrations/hermes/tests -p test_profile_names.py -v
 ```

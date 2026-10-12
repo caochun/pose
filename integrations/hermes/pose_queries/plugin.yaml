@@ -1,0 +1,4 @@
+name: pose_queries
+version: "1.2.0"
+description: "人物、今日事件、截图、状态、短视频及视觉观察微信查询"
+author: chun

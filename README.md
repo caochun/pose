@@ -2,6 +2,8 @@
 
 基于 Orange Pi 5（RK3588）的实时姿态监控系统。使用 NPU 推理 YOLOv8-pose 模型，检测画面中的人是坐着还是站立，记录时长，并通过 RTSP 直播带标注的视频流。
 
+当前也已部署到 `192.168.30.192` 的 RK3576 设备：摄像头与推流约5fps，姿态推理约1fps，使用640输入的 RK3576 INT8 模型，支持多人物轨迹、外观档案及微信事件通知。当前设备服务配置见 `deploy/rk3576/pose_monitor.service`；微信查询、图片解读及人物命名见 [WEIXIN_COMMANDS.md](WEIXIN_COMMANDS.md)，插件源码在 `integrations/hermes/pose_queries/`。以下安装说明保留原 RK3588 配置。
+
 ## 硬件要求
 
 - **Orange Pi 5**（RK3588 SoC）

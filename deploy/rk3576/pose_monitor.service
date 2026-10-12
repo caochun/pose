@@ -1,0 +1,27 @@
+[Unit]
+Description=Pose Monitor - RK3576 YOLOv8 Pose Detection
+Requires=mediamtx.service
+After=mediamtx.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Develop/pose
+Environment=MALLOC_ARENA_MAX=2
+Environment=RKNN_LOG_LEVEL=0
+Environment=LD_LIBRARY_PATH=/usr/local/lib
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /root/Develop/pose/pose_monitor.py \
+    --camera /dev/video0 \
+    --model /root/Develop/pose/models/yolov8_pose/yolov8n-pose-640-rk3576-i8.rknn \
+    --width 1280 \
+    --height 720 \
+    --infer-every 5 \
+    --stream rtsp://127.0.0.1:8554/cam
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
