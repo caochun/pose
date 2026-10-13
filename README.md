@@ -22,7 +22,7 @@ python3 reid_build/validate_reid_runtime.py \
   reid_build/calib/sample.jpg
 ```
 
-当前 ReID 模型已在设备上完成独立实机验证，轨迹系统接入应继续采用按需调用并先运行 shadow mode 的方式校准阈值。
+当前 ReID 模型已在设备上完成独立实机验证。RK3576 服务使用 `POSE_REID_MODE=shadow` 按需调用：只有轻量外观匹配产生新轨迹时才运行 ReID；结果写入 `reid_observations`，暂不改变实际 P/T 分配。积累真实摄像头数据后，再根据相似度分布启用轨迹恢复。
 
 ## 硬件要求
 

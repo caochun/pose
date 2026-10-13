@@ -16,6 +16,60 @@ import cv2
 import numpy as np
 
 
+class ReIDExtractor:
+    """Optional RKNN OSNet extractor used in shadow mode during calibration."""
+
+    def __init__(self):
+        self.mode = os.getenv("POSE_REID_MODE", "off").strip().lower()
+        self.model_path = Path(os.getenv(
+            "POSE_REID_MODEL",
+            "/root/Develop/pose/models/reid/osnet_x0_25-rk3576-i8.rknn",
+        ))
+        self.rknn = None
+        if self.mode not in {"shadow", "on", "enabled"}:
+            return
+        try:
+            from rknnlite.api import RKNNLite
+            self.rknn = RKNNLite(verbose=False)
+            if self.rknn.load_rknn(str(self.model_path)) != 0:
+                raise RuntimeError("load_rknn failed")
+            if self.rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO) != 0:
+                raise RuntimeError("init_runtime failed")
+            print(f"[ReID] {self.mode} mode enabled: {self.model_path}", flush=True)
+        except Exception as exc:
+            print(f"[ReID] disabled: {type(exc).__name__}: {exc}", flush=True)
+            self.rknn = None
+
+    @property
+    def enabled(self):
+        return self.rknn is not None
+
+    def embedding(self, frame, box):
+        if self.rknn is None:
+            return None
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, box)
+        x1, x2 = max(0, min(w - 1, x1)), max(0, min(w, x2))
+        y1, y2 = max(0, min(h - 1, y1)), max(0, min(h, y2))
+        if x2 - x1 < 20 or y2 - y1 < 30:
+            return None
+        # The RKNN converter embeds ImageNet mean/std and expects BGR uint8.
+        crop = cv2.resize(frame[y1:y2, x1:x2], (128, 256), interpolation=cv2.INTER_LINEAR)
+        try:
+            output = np.asarray(self.rknn.inference(inputs=[crop[None, ...]])[0], dtype=np.float32)
+            vector = output.reshape(-1)
+            norm = float(np.linalg.norm(vector))
+            return vector / norm if norm > 1e-6 else None
+        except Exception as exc:
+            print(f"[ReID] inference failed: {type(exc).__name__}", flush=True)
+            return None
+
+    def close(self):
+        if self.rknn is not None:
+            self.rknn.release()
+            self.rknn = None
+
+
 class WeixinNotifier:
     def __init__(self, target="weixin", hermes_bin=None):
         self.target = target
@@ -41,29 +95,38 @@ class WeixinNotifier:
                 text, media, context = self._q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            try:
-                helper = "/root/Develop/pose/hermes_plugins/pose_queries/vision.py"
-                python = os.getenv("HERMES_PYTHON", "/root/.hermes/venvs/hermes/bin/python")
-                p = subprocess.run(
-                    [python, helper, "event", "--target", self.target,
-                     "--text", text, "--media", str(Path(media).resolve()) if media else "",
-                     "--context", json.dumps(context, ensure_ascii=False)],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, timeout=75, check=False,
-                )
-                if p.returncode != 0:
-                    print(f"[Weixin] send failed rc={p.returncode}: {p.stdout[-500:]}", flush=True)
-                    self._retain_failure(media)
-                else:
-                    print("[Weixin] event sent", flush=True)
-                    if media:
-                        try:
-                            Path(media).unlink(missing_ok=True)
-                            print(f"[Weixin] attachment deleted: {media}", flush=True)
-                        except Exception as exc:
-                            print(f"[Weixin] attachment cleanup failed: {exc}", flush=True)
-            except Exception as exc:
-                print(f"[Weixin] send exception: {type(exc).__name__}", flush=True)
+            helper = "/root/Develop/pose/hermes_plugins/pose_queries/vision.py"
+            python = os.getenv("HERMES_PYTHON", "/root/.hermes/venvs/hermes/bin/python")
+            delivered = False
+            # iLink sessions can recover when the user sends a new inbound message.
+            # Keep the event attachment and retry across that session refresh.
+            for attempt in range(1, 6):
+                try:
+                    p = subprocess.run(
+                        [python, helper, "event", "--target", self.target,
+                         "--text", text, "--media", str(Path(media).resolve()) if media else "",
+                         "--context", json.dumps(context, ensure_ascii=False)],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, timeout=75, check=False,
+                    )
+                    if p.returncode == 0:
+                        delivered = True
+                        print("[Weixin] event sent", flush=True)
+                        if media:
+                            try:
+                                Path(media).unlink(missing_ok=True)
+                                print(f"[Weixin] attachment deleted: {media}", flush=True)
+                            except Exception as exc:
+                                print(f"[Weixin] attachment cleanup failed: {exc}", flush=True)
+                        break
+                    print(f"[Weixin] send failed attempt={attempt}/5 rc={p.returncode}: {p.stdout[-500:]}", flush=True)
+                except Exception as exc:
+                    print(f"[Weixin] send exception attempt={attempt}/5: {type(exc).__name__}", flush=True)
+                if attempt < 5:
+                    print("[Weixin] retrying event after 60s; send a message to refresh the Weixin session", flush=True)
+                    if self._stop.wait(60):
+                        break
+            if not delivered:
                 self._retain_failure(media)
 
     def _retain_failure(self, media):
@@ -94,6 +157,14 @@ class ProfileStore:
             id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
             event TEXT NOT NULL, pose TEXT, created_at REAL NOT NULL,
             detail TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS reid_features (
+            profile_id INTEGER PRIMARY KEY, embedding TEXT NOT NULL,
+            updated_at REAL NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS reid_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            track_id INTEGER NOT NULL, assigned_profile_id INTEGER,
+            nearest_profile_id INTEGER, similarity REAL NOT NULL,
+            mode TEXT NOT NULL)""")
         self.db.commit()
 
     @staticmethod
@@ -138,6 +209,49 @@ class ProfileStore:
         with self._lock:
             self.db.execute("INSERT INTO events(profile_id,event,pose,created_at,detail) VALUES(?,?,?,?,?)",
                             (profile_id, kind, pose, now, detail))
+            self.db.commit()
+
+    def nearest_reid(self, embedding):
+        with self._lock:
+            rows = self.db.execute("SELECT profile_id, embedding FROM reid_features").fetchall()
+        best_id, best_sim = None, -1.0
+        for pid, raw in rows:
+            try:
+                sim = self._cosine(embedding, json.loads(raw))
+            except Exception:
+                continue
+            if sim > best_sim:
+                best_id, best_sim = int(pid), sim
+        return best_id, best_sim
+
+    def save_reid(self, profile_id, embedding, now):
+        values = list(map(float, np.asarray(embedding, dtype=np.float32)))
+        with self._lock:
+            row = self.db.execute(
+                "SELECT embedding FROM reid_features WHERE profile_id=?", (profile_id,)
+            ).fetchone()
+            if row:
+                old = np.asarray(json.loads(row[0]), dtype=np.float32)
+                merged = old * 0.85 + np.asarray(values, dtype=np.float32) * 0.15
+                norm = float(np.linalg.norm(merged))
+                values = (merged / norm if norm > 1e-6 else merged).tolist()
+                self.db.execute(
+                    "UPDATE reid_features SET embedding=?, updated_at=? WHERE profile_id=?",
+                    (json.dumps(values), now, profile_id),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO reid_features(profile_id, embedding, updated_at) VALUES(?,?,?)",
+                    (profile_id, json.dumps(values), now),
+                )
+            self.db.commit()
+
+    def reid_observation(self, now, track_id, assigned_id, nearest_id, similarity, mode="shadow"):
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO reid_observations(created_at,track_id,assigned_profile_id,nearest_profile_id,similarity,mode) VALUES(?,?,?,?,?,?)",
+                (now, track_id, assigned_id, nearest_id, float(similarity), mode),
+            )
             self.db.commit()
 
     def close(self):
@@ -205,6 +319,7 @@ class PersonEventManager:
         if isinstance(self.notifier, WeixinNotifier):
             self.notifier._failed_media = list(old_media[-8:])
         self.tracks = {}
+        self.reid = ReIDExtractor()
         self.next_track_id = 1
         self.labels = []
         self._last_diag = 0.0
@@ -255,6 +370,14 @@ class PersonEventManager:
             if idx not in assignments:
                 tid, kind, pid, p, sim, box = self._new_track(det, feat, pose, now, active_profiles)
                 active_profiles.add(pid); assignments[idx] = tid
+                if self.reid.enabled:
+                    embedding = self.reid.embedding(frame, det[:4])
+                    if embedding is not None:
+                        nearest_id, reid_sim = self.store.nearest_reid(embedding)
+                        self.store.reid_observation(now, tid, pid, nearest_id, reid_sim)
+                        nearest = f"P{nearest_id}" if nearest_id is not None else "none"
+                        print(f"[ReID shadow] T{tid} assigned P{pid}; nearest={nearest} sim={reid_sim:.3f}", flush=True)
+                        self.store.save_reid(pid, embedding, now)
                 events.append((kind, tid, pid, p, sim, box))
                 continue
             tid = assignments[idx]
@@ -343,4 +466,4 @@ class PersonEventManager:
         self.notifier.send(f"人物事件（{len(events)}）\n" + "\n".join(lines), media, context)
 
     def close(self):
-        self.notifier.close(); self.store.close()
+        self.reid.close(); self.notifier.close(); self.store.close()
