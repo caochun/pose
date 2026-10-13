@@ -165,6 +165,16 @@ class ProfileStore:
             track_id INTEGER NOT NULL, assigned_profile_id INTEGER,
             nearest_profile_id INTEGER, similarity REAL NOT NULL,
             mode TEXT NOT NULL)""")
+        # A single cross-process collection session is controlled by the
+        # Hermes command plugin and consumed by the monitor process.
+        self.db.execute("""CREATE TABLE IF NOT EXISTS reid_collection (
+            id INTEGER PRIMARY KEY CHECK(id=1), active INTEGER NOT NULL DEFAULT 0,
+            profile_id INTEGER, track_id INTEGER, started_at REAL,
+            updated_at REAL NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS reid_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER NOT NULL,
+            track_id INTEGER, created_at REAL NOT NULL, pose TEXT NOT NULL,
+            box TEXT NOT NULL, embedding TEXT NOT NULL)""")
         self.db.commit()
 
     @staticmethod
@@ -254,6 +264,27 @@ class ProfileStore:
             )
             self.db.commit()
 
+    def collection_state(self):
+        with self._lock:
+            row = self.db.execute(
+                "SELECT active,profile_id,track_id,started_at FROM reid_collection WHERE id=1"
+            ).fetchone()
+        if not row or not row[0] or row[1] is None:
+            return None
+        return {"profile_id": int(row[1]), "track_id": int(row[2]) if row[2] is not None else None,
+                "started_at": float(row[3] or 0)}
+
+    def save_reid_sample(self, profile_id, track_id, embedding, now, pose, box):
+        values = list(map(float, np.asarray(embedding, dtype=np.float32)))
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO reid_samples(profile_id,track_id,created_at,pose,box,embedding) VALUES(?,?,?,?,?,?)",
+                (int(profile_id), int(track_id), float(now), pose or "unknown",
+                 json.dumps(list(map(float, box))), json.dumps(values)),
+            )
+            self.db.execute("UPDATE reid_collection SET updated_at=? WHERE id=1", (float(now),))
+            self.db.commit()
+
     def close(self):
         with self._lock:
             self.db.close()
@@ -326,6 +357,10 @@ class PersonEventManager:
         self._inference_at = 0.0
         self._frame_size = (0, 0)
         self._last_status = 0.0
+        self._collection_last_at = 0.0
+        self._collection_last_box = None
+        self._collection_last_pose = None
+        self._collection_warn_at = 0.0
 
     def _new_track(self, det, feature, pose, now, active_profiles):
         pid, similarity, is_new = self.store.match_or_create(feature, now, exclude_ids=active_profiles)
@@ -339,12 +374,41 @@ class PersonEventManager:
         self.store.event(pid, kind, pose, now, f"track={tid};similarity={similarity:.3f}")
         return tid, kind, pid, pose, similarity, det[:4]
 
+    def _collect_sample(self, frame, tid, pid, pose, box, now, collection, person_count):
+        if not (collection and person_count == 1 and pid == collection["profile_id"] and self.reid.enabled):
+            return
+        embedding = self.reid.embedding(frame, box)
+        if embedding is None:
+            return
+        box = tuple(map(float, box))
+        changed = self._collection_last_box is None
+        if self._collection_last_box is not None:
+            old = self._collection_last_box
+            old_area = max((old[2]-old[0])*(old[3]-old[1]), 1.0)
+            new_area = max((box[2]-box[0])*(box[3]-box[1]), 1.0)
+            area_ratio = max(new_area, old_area) / min(new_area, old_area)
+            center_shift = _center_distance(old, box, frame.shape)
+            changed = area_ratio >= 1.25 or center_shift >= 0.08 or pose != self._collection_last_pose
+        if (now - self._collection_last_at >= 8.0) or changed:
+            self.store.save_reid_sample(collection["profile_id"], tid, embedding, now, pose, box)
+            self._collection_last_at = now
+            self._collection_last_box = box
+            self._collection_last_pose = pose
+            print(f"[ReID collection] saved P{collection['profile_id']} sample pose={pose} changed={changed}", flush=True)
+
     def process(self, frame, detections, _global_pose=None, now=None):
         now = time.time() if now is None else now
         self._inference_at = now
         self._frame_size = (frame.shape[1], frame.shape[0])
         detections = list(detections or [])
         prepared = [(d, appearance_feature(frame, d[:4]), _pose_from_detection(d)) for d in detections]
+        collection = self.store.collection_state()
+        # Collection is deliberately conservative: the command promises a
+        # one-person scene, so any multi-person inference is discarded.
+        if collection and len(prepared) != 1:
+            if now - self._collection_warn_at >= 30:
+                print(f"[ReID collection] skipped frame: expected one person, got {len(prepared)}", flush=True)
+                self._collection_warn_at = now
         old_ids = list(self.tracks)
         candidates = []
         for tid in old_ids:
@@ -378,6 +442,7 @@ class PersonEventManager:
                         nearest = f"P{nearest_id}" if nearest_id is not None else "none"
                         print(f"[ReID shadow] T{tid} assigned P{pid}; nearest={nearest} sim={reid_sim:.3f}", flush=True)
                         self.store.save_reid(pid, embedding, now)
+                self._collect_sample(frame, tid, pid, p, box, now, collection, len(prepared))
                 events.append((kind, tid, pid, p, sim, box))
                 continue
             tid = assignments[idx]
@@ -396,6 +461,9 @@ class PersonEventManager:
                 self.store.event(tr["profile_id"], "posture_changed", pose, now, f"track={tid}")
                 events.append(("posture_changed", tid, tr["profile_id"], pose, tr["similarity"], det[:4]))
             self.store.update(tr["profile_id"], tr["feature"], now, pose)
+
+            self._collect_sample(frame, tid, tr["profile_id"], pose, det[:4], now,
+                                 collection, len(prepared))
 
         for tid in old_ids:
             if tid in matched_tracks:

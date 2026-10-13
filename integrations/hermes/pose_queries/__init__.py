@@ -46,6 +46,73 @@ def query(sql, args=()):
         return db.execute(sql, args).fetchall()
 
 
+def _ensure_collection_tables(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS reid_collection (
+        id INTEGER PRIMARY KEY CHECK(id=1), active INTEGER NOT NULL DEFAULT 0,
+        profile_id INTEGER, track_id INTEGER, started_at REAL, updated_at REAL NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS reid_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER NOT NULL,
+        track_id INTEGER, created_at REAL NOT NULL, pose TEXT NOT NULL,
+        box TEXT NOT NULL, embedding TEXT NOT NULL)""")
+
+
+def start_collection(raw_args=''):
+    arg = raw_args.strip()
+    if not arg:
+        return '用法：/开始收集 老曹 或 /开始收集 P1。开始前画面中必须只有这个人。'
+    try:
+        pid = resolve(arg)
+    except ValueError as exc:
+        return str(exc)
+    state, fresh = snapshot()
+    visible = visible_tracks(state) if fresh else []
+    if not fresh:
+        return '实时检测状态已过期，请确认摄像头正常后重试。'
+    if len(visible) != 1:
+        return f'开始收集要求当前恰好检出1人，当前为{len(visible)}人；请清场后重试。'
+    track = visible[0]
+    if int(track.get('profile_id', -1)) != pid:
+        return f'当前检出的是{display(track.get("profile_id"))}，不是{display(pid)}；请确认目标人物后重试。'
+    now = time.time()
+    with sqlite3.connect(DB, timeout=3) as db:
+        _ensure_collection_tables(db)
+        row = db.execute('SELECT active,profile_id FROM reid_collection WHERE id=1').fetchone()
+        if row and row[0]:
+            active_pid = int(row[1]) if row[1] is not None else None
+            if active_pid == pid:
+                count = db.execute('SELECT COUNT(*) FROM reid_samples WHERE profile_id=?', (pid,)).fetchone()[0]
+                return f'正在收集{display(pid)}的ReID样本，已有{count}条；请继续变换角度、姿态和距离，完成后发送 /停止收集。'
+            return f'当前正在收集{display(active_pid)}，请先发送 /停止收集。'
+        db.execute('''INSERT INTO reid_collection(id,active,profile_id,track_id,started_at,updated_at)
+                      VALUES(1,1,?,?,?,?)
+                      ON CONFLICT(id) DO UPDATE SET active=1,profile_id=excluded.profile_id,
+                      track_id=excluded.track_id,started_at=excluded.started_at,updated_at=excluded.updated_at''',
+                   (pid, int(track['track_id']), now, now))
+        db.commit()
+        count = db.execute('SELECT COUNT(*) FROM reid_samples WHERE profile_id=?', (pid,)).fetchone()[0]
+    suffix = f'，该人物已有{count}条历史样本' if count else ''
+    return f'已开始收集{display(pid)}的ReID样本{suffix}。请依次变换正面、侧面、背面、坐姿、站姿和距离；完成后发送 /停止收集。'
+
+
+def stop_collection(raw_args=''):
+    if raw_args.strip():
+        return '用法：/停止收集'
+    now = time.time()
+    with sqlite3.connect(DB, timeout=3) as db:
+        _ensure_collection_tables(db)
+        row = db.execute('SELECT active,profile_id,started_at FROM reid_collection WHERE id=1').fetchone()
+        if not row or not row[0] or row[1] is None:
+            return '当前没有进行中的ReID样本收集。'
+        pid, started = int(row[1]), float(row[2] or now)
+        db.execute('UPDATE reid_collection SET active=0,updated_at=? WHERE id=1', (now,))
+        count = db.execute('SELECT COUNT(*) FROM reid_samples WHERE profile_id=?', (pid,)).fetchone()[0]
+        session_count = db.execute('SELECT COUNT(*) FROM reid_samples WHERE profile_id=? AND created_at>=?',
+                                    (pid, started)).fetchone()[0]
+        db.commit()
+    return (f'已停止收集{display(pid)}。本次持续{max(0, now-started):.0f}秒，新增{session_count}条样本，'
+            f'累计{count}条；样本已保留，可继续用 /开始收集 {display(pid)} 追加。')
+
+
 def people(raw_args=''):
     arg = raw_args.strip()
     pid = resolve(arg) if arg else None
@@ -407,10 +474,18 @@ def register(ctx):
     async def handle_today(args=''):
         return await guarded(today, args)
 
+    async def handle_start_collection(args=''):
+        return await guarded(start_collection, args)
+
+    async def handle_stop_collection(args=''):
+        return await guarded(stop_collection, args)
+
     options = {'busy_policy': 'dispatch'} if 'busy_policy' in inspect.signature(ctx.register_command).parameters else {}
     for name, handler, description, hint in [
         ('人物', handle_people, '查看实时人物和最近档案', '[P编号或名称]'),
         ('命名', handle_name, '给人物档案命名或清除名称', '[P编号 名称]'),
+        ('开始收集', handle_start_collection, '为指定人物开始收集ReID样本', '[名称或P编号]'),
+        ('停止收集', handle_stop_collection, '停止当前ReID样本收集', ''),
         ('今天', handle_today, '查看北京时间今日人物事件', ''),
         ('截图', camera.image, '发送当前摄像头标注截图', ''),
         ('状态', health, '查看设备负载和服务状态', ''),
