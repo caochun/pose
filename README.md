@@ -4,6 +4,26 @@
 
 当前也已部署到 `192.168.30.192` 的 RK3576 设备：摄像头与推流约5fps，姿态推理约1fps，使用640输入的 RK3576 INT8 模型，支持多人物轨迹、外观档案及微信事件通知。当前设备服务配置见 `deploy/rk3576/pose_monitor.service`；微信查询、图片解读及人物命名见 [WEIXIN_COMMANDS.md](WEIXIN_COMMANDS.md)，插件源码在 `integrations/hermes/pose_queries/`。以下安装说明保留原 RK3588 配置。
 
+### RK3576 ReID 模型
+
+设备上已转换并验证 OSNet-x0.25 ReID 模型：
+
+- 输入 `1×256×128×3`，BGR `uint8` 人物裁剪；转换器内置 ImageNet mean/std
+- 输出 512 维 `float32` embedding（Lite 运行时自动完成 INT8 输出反量化）
+- 模型：`models/reid/osnet_x0_25-rk3576-i8.rknn`
+- 转换工具链和设备 runtime 均为 RKNN 2.5.0；实测单次推理约 3.5ms
+- ONNX 与 RKNN 输出余弦相似度约 0.993；重复推理余弦相似度约 1.0
+
+转换脚本位于 `reid_build/`，设备端验证可运行：
+
+```bash
+python3 reid_build/validate_reid_runtime.py \
+  models/reid/osnet_x0_25-rk3576-i8.rknn \
+  reid_build/calib/sample.jpg
+```
+
+当前 ReID 模型已在设备上完成独立实机验证，轨迹系统接入应继续采用按需调用并先运行 shadow mode 的方式校准阈值。
+
 ## 硬件要求
 
 - **Orange Pi 5**（RK3588 SoC）
