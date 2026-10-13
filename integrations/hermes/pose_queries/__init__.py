@@ -110,7 +110,7 @@ def stop_collection(raw_args=''):
                                     (pid, started)).fetchone()[0]
         db.commit()
     return (f'已停止收集{display(pid)}。本次持续{max(0, now-started):.0f}秒，新增{session_count}条样本，'
-            f'累计{count}条；样本已保留，可继续用 /开始收集 {display(pid)} 追加。')
+            f'累计{count}条；样本已保留，可继续用 /开始收集 P{pid} 追加。')
 
 
 def people(raw_args=''):
