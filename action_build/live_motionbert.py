@@ -111,7 +111,8 @@ class LiveFeed:
                                  'state': 'candidate' if result else 'collecting',
                                  'result': result})
             return {'timestamp': now, 'source_at': self.source_at, 'source_fresh': fresh,
-                    'model': 'MotionBERT NTU60', 'backend': 'CPU', 'loaded': self.loaded,
+                    'model': getattr(self, 'model_name', 'MotionBERT NTU60'),
+                    'backend': 'CPU', 'loaded': self.loaded,
                     'interval_seconds': self.interval, 'window_seconds': self.window_seconds,
                     'max_result_age': self.max_age, 'busy': self.busy is not None,
                     'last_error': self.last_error, 'people': rows, 'experimental': True}
