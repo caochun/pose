@@ -30,6 +30,7 @@ import ctypes
 import glob
 import multiprocessing as mp
 import pathlib
+import json
 from datetime import datetime
 from person_events import PersonEventManager
 from yolo26_pose import decode_yolo26
@@ -136,6 +137,7 @@ INPUT_SIZE  = 640
 CAMERA_FPS  = 5
 NMS_THRESH  = 0.45
 CONF_THRESH = 0.60
+_ACTIONS_STATUS = pathlib.Path('/run/pose/actions.json')
 
 # ─── 温度（RK3588 thermal zone） ─────────────────────────────────
 _THERMAL = {
@@ -476,7 +478,7 @@ def draw_panel(frame, pose, sitting_total, standing_total, stats):
             cv2.putText(frame, val, (x0 + rk, y), font, 0.60, col, 1, cv2.LINE_AA)
 
 
-def draw_overlay(frame, detections, pose, stats=None, labels=None):
+def draw_overlay(frame, detections, pose, stats=None, labels=None, actions=None):
     """久坐提醒横幅 + 检测框 + COCO 骨骼关键点。每帧调用，开销低。"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     h, w = frame.shape[:2]
@@ -507,6 +509,22 @@ def draw_overlay(frame, detections, pose, stats=None, labels=None):
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         text = f'P{label_id} {label_pose}' if label_id is not None else label_pose
         cv2.putText(frame, text, (x1, max(20, y1 - 10)), font, 0.7, color, 2)
+        if actions and labels and idx < len(labels):
+            track_id, profile_id, _ = labels[idx]
+            action = actions.get((int(track_id), int(profile_id)))
+            if action:
+                candidate = action.get('candidate_actions', [{}])[0]
+                action_name = str(candidate.get('label', '')).strip()
+                score = float(candidate.get('score', 0.0))
+                if action_name and score > 0:
+                    if len(action_name) > 26:
+                        action_name = action_name[:23].rstrip() + '...'
+                    action_text = f'ACT {action_name} {score:.0%}'
+                    action_y = max(38, y1 - 32)
+                    cv2.putText(frame, action_text, (x1, action_y), font, 0.52,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(frame, action_text, (x1, action_y), font, 0.52,
+                                (180, 70, 220), 1, cv2.LINE_AA)
         # 检测结果由推理进程序列化为 list，也兼容 numpy 数组；对异常结果
         # 做保护，保证绘图失败不会影响摄像头推流。
         try:
@@ -765,6 +783,8 @@ class PoseMonitor:
         # 面板缓存（节流绘制）
         self._panel_cache = None   # 上次渲染的面板区域 (BGR numpy)
         self._panel_count = 0
+        self._actions_mtime = None
+        self._actions_cache = {}
 
     # ── CSV 日志 ──────────────────────────────────────────────
     def init_csv(self):
@@ -775,6 +795,29 @@ class PoseMonitor:
             self.csv_writer.writerow(
                 ['timestamp','pose','duration_sec','sitting_total','standing_total'])
         self.csv_file.flush()
+
+    def _read_actions(self):
+        """读取最新动作候选；按文件 mtime 缓存，避免每帧解析 JSON。"""
+        try:
+            mtime = _ACTIONS_STATUS.stat().st_mtime_ns
+            if mtime == self._actions_mtime:
+                return self._actions_cache
+            data = json.loads(_ACTIONS_STATUS.read_text(encoding='utf-8'))
+            now = time.time()
+            if (not data.get('loaded') or not data.get('source_fresh')
+                    or not 0 <= now - data.get('timestamp', 0) <= 5):
+                self._actions_mtime, self._actions_cache = mtime, {}
+                return self._actions_cache
+            result = {}
+            for person in data.get('people', []):
+                action = person.get('result')
+                if not action or not 0 <= now - action.get('captured_at', 0) <= 30:
+                    continue
+                result[(int(person['track_id']), int(person['profile_id']))] = action
+            self._actions_mtime, self._actions_cache = mtime, result
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            return self._actions_cache
 
     def log_pose_change(self, old_pose, duration):
         self.session_stats[old_pose] += duration
@@ -957,7 +1000,7 @@ class PoseMonitor:
                     bgr[_PANEL_RY:_PANEL_RY+_PANEL_PH, rx:rx+_PANEL_PW] = self._panel_cache
                 # 检测框 + 久坐提醒：每帧绘制（现在绘制所有人物）
                 draw_overlay(bgr, self.last_detections, self.last_pose, stats,
-                             self.events.labels)
+                             self.events.labels, self._read_actions())
                 if pending_events:
                     self.events.emit(pending_events, bgr)
 
