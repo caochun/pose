@@ -27,6 +27,7 @@ EVENT = {'new_profile': '建立档案', 'person_appeared': '检测到出现',
 log = logging.getLogger(__name__)
 from .vision import analyze, latest_person, VisionUnavailable
 from .labels import names, display, resolve, rename
+from .actions import action_lines
 
 
 def clock(ts):
@@ -182,7 +183,8 @@ async def service(name, user=False):
 async def health(raw_args=''):
     if raw_args.strip():
         return '用法：/状态'
-    states = await asyncio.gather(service('pose_monitor'), service('mediamtx'), service('hermes-gateway', True))
+    states = await asyncio.gather(service('pose_monitor'), service('mediamtx'), service('hermes-gateway', True),
+                                  service('pose_actions'))
     data, fresh = snapshot()
     lines = ['设备状态（北京时间）', f'姿态服务：{states[0]}；MediaMTX：{states[1]}；Hermes：{states[2]}',
              f'系统负载（1/5/15分钟）：' + ' / '.join(f'{v:.2f}' for v in os.getloadavg())]
@@ -211,7 +213,19 @@ async def health(raw_args=''):
                   f'最近有效推理：{inference_age:.0f}秒前；' + (f'检出{visible}人' if fresh and inference_age <= 5 else '检测结果已过期，不能判定当前人数')]
     else:
         lines.append('实时检测状态尚未生成。')
+    lines.append(f'动作服务：{states[3]}')
+    if states[3] == 'active':
+        lines.extend(await asyncio.to_thread(action_lines, profile_display=display))
     return '\n'.join(lines)
+
+
+async def actions(raw_args=''):
+    if raw_args.strip():
+        return '用法：/动作'
+    state = await service('pose_actions')
+    if state != 'active':
+        return f'动作识别服务：{state}，请检查 /状态。'
+    return '\n'.join(await asyncio.to_thread(action_lines, profile_display=display))
 
 
 def credentials():
@@ -491,6 +505,7 @@ def register(ctx):
         ('今天', handle_today, '查看北京时间今日人物事件', ''),
         ('截图', camera.image, '发送当前摄像头标注截图', ''),
         ('状态', health, '查看设备负载和服务状态', ''),
+        ('动作', actions, '查看当前人物的动作候选', ''),
         ('视频', camera.video, '发送摄像头短视频，默认5秒', '[3–15秒]'),
         ('看看', camera.look, '解读当前摄像头画面并发送图片', '[问题]'),
         ('变化', camera.change, '对比间隔5秒的两张摄像头截图', '[3–15秒]'),

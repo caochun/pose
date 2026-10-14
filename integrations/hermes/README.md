@@ -4,7 +4,7 @@ The `media_delivery` user plugin provides `/rtsp` and the `deliver_file`
 tool. It is tested with Hermes v0.21.5 (release v2026.9.24) and uses
 Hermes' built-in Weixin adapter.
 
-The `pose_queries` plugin adds `/人物`, `/命名`, `/开始收集`, `/停止收集`, `/今天`, `/截图`, `/状态`,
+The `pose_queries` plugin adds `/人物`, `/命名`, `/开始收集`, `/停止收集`, `/今天`, `/截图`, `/状态`, `/动作`,
 `/视频`, `/看看`, and `/变化`. It reads the pose monitor's local records and
 uses the configured DeepSeek Flash API for picture observations. Chinese usage
 and storage limits are documented in [WEIXIN_COMMANDS.md](../../WEIXIN_COMMANDS.md).
@@ -65,6 +65,10 @@ install -d "$plugin_dir" "$event_plugin_dir"
 install -m 644 integrations/hermes/pose_queries/__init__.py integrations/hermes/pose_queries/vision.py integrations/hermes/pose_queries/labels.py integrations/hermes/pose_queries/plugin.yaml "$plugin_dir/"
 install -m 644 integrations/hermes/pose_queries/__init__.py integrations/hermes/pose_queries/vision.py integrations/hermes/pose_queries/labels.py integrations/hermes/pose_queries/plugin.yaml "$event_plugin_dir/"
 ```
+
+The optional `pose_actions.service` reads `/run/pose/skeleton.json` and writes
+the latest MotionBERT candidate to `/run/pose/actions.json`; it runs on CPU
+every 15 seconds and reports experimental candidates.
 
 Keep both `media_delivery` and `pose_queries` in the `plugins.enabled` list
 in `/root/.hermes/config.yaml`, then restart `hermes-gateway.service`. The pose

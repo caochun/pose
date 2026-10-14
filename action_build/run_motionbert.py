@@ -49,11 +49,12 @@ def make_windows(snapshots, seconds=8, min_samples=8):
                 buffers.pop(key)
 
 
-def evaluate(session, frames, key, clip, names, runs=1):
+def evaluate(session, frames, key, clip, names, runs=1, warmup=True):
     raw_points = [p[1]["keypoints"] for p in clip]
     raw_conf = [p[1]["confidence"] for p in clip]
     x = prepare_input(raw_points, raw_conf, clip[-1][2], frames)
-    session.run(None, {"skeletons": x})
+    if warmup:
+        session.run(None, {"skeletons": x})
     cpu_started = time.process_time()
     started = time.perf_counter()
     for _ in range(runs):
