@@ -18,7 +18,7 @@ ExecStart=/usr/bin/python3 -u /root/Develop/pose/pose_monitor.py \
     --model /root/Develop/pose/models/yolo26_pose/yolo26n-pose-640-rk3576-i8.rknn \
     --width 1280 \
     --height 720 \
-    --infer-every 5 \
+    --infer-every 1 \
     --stream rtsp://127.0.0.1:8554/cam
 Restart=always
 RestartSec=5
