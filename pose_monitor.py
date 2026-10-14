@@ -32,6 +32,7 @@ import multiprocessing as mp
 import pathlib
 from datetime import datetime
 from person_events import PersonEventManager
+from yolo26_pose import decode_yolo26
 
 # ─── RGA 硬件色彩转换（可选，需要 rga_cvt.so + librga） ────────────────
 def _load_rga():
@@ -217,7 +218,10 @@ def _decode_rk3576_branch(box_output, keypoint_output, grid_w, grid_h, stride,
 
 
 def decode_outputs(outputs, scale, pad_x, pad_y, orig_w, orig_h):
-    """Decode either legacy 320px single-output or RK3576 640px export."""
+    """Decode legacy YOLOv8 exports or the nine raw heads from YOLO26."""
+    if len(outputs) == 9:
+        return decode_yolo26(outputs, scale, pad_x, pad_y, orig_w, orig_h,
+                             conf_threshold=CONF_THRESH, input_size=INPUT_SIZE)
     if len(outputs) == 4:
         prepared = [np.asarray(x) for x in outputs]
         for i, x in enumerate(prepared[:3]):
@@ -498,9 +502,11 @@ def _inference_process(model_path, frame_queue, result_queue,
 
     from rknnlite.api import RKNNLite
     rknn = RKNNLite(verbose=False)
-    rknn.load_rknn(model_path)
-    rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO)
-    print(f'[InferProc:{os.getpid()}] RKNN loaded, max_rss={max_rss_mb}MB', flush=True)
+    if rknn.load_rknn(model_path) != 0:
+        raise RuntimeError(f'Could not load pose model: {model_path}')
+    if rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO) != 0:
+        raise RuntimeError(f'Could not initialize pose model: {model_path}')
+    print(f'[InferProc:{os.getpid()}] RKNN loaded: {model_path}, max_rss={max_rss_mb}MB', flush=True)
 
     infer_count = 0   # 每秒重置，用于 FPS 计算
     total_count = 0   # 累计，用于 RSS 检查
@@ -864,7 +870,8 @@ class PoseMonitor:
                             bgr, self.last_detections, self.last_pose)
 
                 self.events.publish_status(
-                    self._fps_val, self.last_infer_stats.get("fps", 0.0), now)
+                    self._fps_val, self.last_infer_stats.get("fps", 0.0), now,
+                    model_name=os.path.basename(self.model_path))
 
                 # 面板：每 _PANEL_EVERY 帧重绘，其余帧贴缓存
                 self._panel_count += 1

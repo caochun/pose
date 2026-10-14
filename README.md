@@ -4,6 +4,8 @@
 
 当前也已部署到 `192.168.30.192` 的 RK3576 设备：摄像头与推流约5fps，姿态推理约1fps，使用640输入的 RK3576 INT8 模型，支持多人物轨迹、外观档案及微信事件通知。当前设备服务配置见 `deploy/rk3576/pose_monitor.service`；微信查询、图片解读及人物命名见 [WEIXIN_COMMANDS.md](WEIXIN_COMMANDS.md)，插件源码在 `integrations/hermes/pose_queries/`。以下安装说明保留原 RK3588 配置。
 
+设备还包含用于对比测试的 YOLO26n-pose RK3576 INT8 模型，源码输出解码和转换脚本位于 `pose_build/`；当前服务已切换到该模型，旧的 YOLOv8n-pose 文件保留在设备上用于回退。
+
 ### RK3576 ReID 模型
 
 设备上已转换并验证 OSNet-x0.25 ReID 模型：

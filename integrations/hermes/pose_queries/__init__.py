@@ -201,6 +201,8 @@ async def health(raw_args=''):
     if temps:
         lines.append(f'最高温度：{max(temps):.1f}℃')
     if data:
+        if data.get('pose_model'):
+            lines.append(f'姿态模型：{data["pose_model"]}')
         age = max(0, time.time()-data.get('timestamp', 0))
         inference_age = max(0, time.time()-data.get('inference_at', 0))
         visible = sum(tr['missed_results'] == 0 for tr in data.get('tracks', []))

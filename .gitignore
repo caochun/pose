@@ -15,6 +15,14 @@ __pycache__/
 reid_build/*.pth
 reid_build/calib/
 
+# Pose conversion inputs and compiler intermediates
+pose_build/calib/
+pose_build/*.pth
+pose_build/*.pt
+pose_build/*.npz
+pose_build/*.onnx
+pose_build/check*.onnx
+
 # 人物记录和摄像头媒体属于运行数据
 *.sqlite3
 *.sqlite3-*

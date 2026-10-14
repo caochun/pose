@@ -490,7 +490,7 @@ class PersonEventManager:
             self.labels.append((tid, tr["profile_id"], pose))
         return events
 
-    def publish_status(self, stream_fps, inference_fps, now=None):
+    def publish_status(self, stream_fps, inference_fps, now=None, model_name=None):
         now = time.time() if now is None else now
         if now - self._last_status < 1.0:
             return
@@ -500,6 +500,7 @@ class PersonEventManager:
         try:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             payload = {"timestamp": now, "inference_at": self._inference_at,
+                       "pose_model": model_name,
                        "stream_fps": float(stream_fps), "inference_fps": float(inference_fps),
                        "frame_size": self._frame_size,
                        "tracks": [{"track_id": tid, "profile_id": tr["profile_id"],
