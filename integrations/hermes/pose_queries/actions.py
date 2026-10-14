@@ -25,7 +25,9 @@ def action_lines(path=None, now=None, profile_display=None):
         data = json.loads(path.read_text())
         if not 0 <= now - data.get('timestamp', 0) <= 5:
             return ['动作识别状态已过期。']
-        lines = ['动作候选（MotionBERT，CPU，实验）：']
+        model_name = data.get('model', '动作模型')
+        backend = data.get('backend', 'CPU')
+        lines = [f'动作候选（{model_name}，{backend}，实验）：']
         if not data.get('loaded'):
             return lines + ['模型加载中。']
         if not data.get('source_fresh'):
