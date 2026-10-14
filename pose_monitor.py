@@ -35,6 +35,14 @@ from datetime import datetime
 from person_events import PersonEventManager
 from yolo26_pose import decode_yolo26
 
+# Pillow is used only for the Chinese MotionBERT label.  OpenCV's built-in
+# Hershey fonts do not contain CJK glyphs, so keep a graceful ASCII fallback
+# for development hosts where Pillow or a CJK font is not installed yet.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = ImageDraw = ImageFont = None
+
 # ─── RGA 硬件色彩转换（可选，需要 rga_cvt.so + librga） ────────────────
 def _load_rga():
     so = pathlib.Path(__file__).parent / 'rga_cvt.so'
@@ -138,6 +146,100 @@ CAMERA_FPS  = 5
 NMS_THRESH  = 0.45
 CONF_THRESH = 0.60
 _ACTIONS_STATUS = pathlib.Path('/run/pose/actions.json')
+
+# MotionBERT NTU-60 class order.  Keep this in the monitor as well as the
+# Hermes query integration so the RTSP overlay can be rendered independently.
+MOTION_LABELS_ZH = (
+    '喝水', '吃东西', '刷牙', '梳头', '物品掉落', '拾起物品', '投掷', '坐下', '站起', '拍手',
+    '阅读', '书写', '撕纸', '穿外套', '脱外套', '穿鞋', '脱鞋', '戴眼镜', '摘眼镜', '戴帽子',
+    '摘帽子', '欢呼', '挥手', '踢物品', '伸手进口袋', '单脚跳', '跳起', '打电话', '使用手机或平板', '键盘打字',
+    '指向物品', '自拍', '看手表', '搓手', '点头或鞠躬', '摇头', '擦脸', '敬礼', '双手合十', '双手交叉示意停止',
+    '打喷嚏或咳嗽', '踉跄', '跌倒', '摸头', '摸胸口', '摸背', '摸脖子', '呕吐动作', '扇风', '挥拳或拍打他人',
+    '踢他人', '推他人', '拍他人后背', '指向他人', '拥抱', '递东西给他人', '碰他人口袋', '握手', '相向走近', '相互走远',
+)
+
+_ACTION_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+)
+_action_font_path = next((p for p in _ACTION_FONT_CANDIDATES if os.path.exists(p)), None)
+_ACTION_LATIN_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+)
+_action_latin_font_path = next((p for p in _ACTION_LATIN_FONT_CANDIDATES if os.path.exists(p)), None)
+_action_font_cache = {}
+
+
+def _action_label(candidate):
+    """Return the Chinese NTU-60 label for one MotionBERT candidate."""
+    try:
+        index = int(candidate.get('id', -1))
+    except (AttributeError, TypeError, ValueError):
+        index = -1
+    if 0 <= index < len(MOTION_LABELS_ZH):
+        return MOTION_LABELS_ZH[index]
+    # Older action workers wrote a label field; preserve that during rollout.
+    return str(candidate.get('label', '')).strip() if isinstance(candidate, dict) else ''
+
+
+def _draw_action_texts(frame, texts):
+    """Draw action labels with a CJK font, falling back to OpenCV if needed."""
+    if not texts:
+        return
+    if Image is None or ImageDraw is None or ImageFont is None or not _action_font_path:
+        for text, x, y in texts:
+            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (180, 70, 220), 1, cv2.LINE_AA)
+        return
+    # Render all action labels in one RGB conversion per frame.  Drawing is
+    # deferred until after the OpenCV skeleton pass so the conversion cannot
+    # overwrite any later annotations.
+    try:
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil)
+        font = _action_font_cache.get(('cjk', 18))
+        if font is None:
+            font = ImageFont.truetype(_action_font_path, 18)
+            _action_font_cache[('cjk', 18)] = font
+        latin_font = _action_font_cache.get(('latin', 18))
+        if latin_font is None:
+            latin_font = (ImageFont.truetype(_action_latin_font_path, 18)
+                          if _action_latin_font_path else font)
+            _action_font_cache[('latin', 18)] = latin_font
+        for text, x, y in texts:
+            # Pillow's anchor uses the baseline differently from OpenCV; the
+            # small upward adjustment keeps the two overlays aligned.
+            px, py = x, max(0, y - 18)
+            # Droid Sans Fallback contains the CJK glyphs but intentionally
+            # lacks several ASCII glyphs.  Draw ASCII runs with DejaVu so the
+            # score (for example ``72%``) remains readable instead of boxes.
+            run = ''
+            run_font = None
+            for char in text:
+                char_font = latin_font if ord(char) < 128 else font
+                if run and char_font is not run_font:
+                    draw.text((px, py), run, font=run_font,
+                              fill=(180, 70, 220), stroke_width=2,
+                              stroke_fill=(255, 255, 255))
+                    px += int(draw.textlength(run, font=run_font))
+                    run = ''
+                run += char
+                run_font = char_font
+            if run:
+                draw.text((px, py), run, font=run_font,
+                          fill=(180, 70, 220), stroke_width=2,
+                          stroke_fill=(255, 255, 255))
+        rendered = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+        frame[...] = rendered
+    except Exception:
+        # A missing/corrupt font must never interrupt the RTSP pipeline.
+        for text, x, y in texts:
+            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (180, 70, 220), 1, cv2.LINE_AA)
 
 # ─── 温度（RK3588 thermal zone） ─────────────────────────────────
 _THERMAL = {
@@ -482,6 +584,7 @@ def draw_overlay(frame, detections, pose, stats=None, labels=None, actions=None)
     """久坐提醒横幅 + 检测框 + COCO 骨骼关键点。每帧调用，开销低。"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     h, w = frame.shape[:2]
+    action_texts = []
 
     if stats:
         cont   = stats.get('cont_sit', 0)
@@ -514,17 +617,14 @@ def draw_overlay(frame, detections, pose, stats=None, labels=None, actions=None)
             action = actions.get((int(track_id), int(profile_id)))
             if action:
                 candidate = action.get('candidate_actions', [{}])[0]
-                action_name = str(candidate.get('label', '')).strip()
+                action_name = _action_label(candidate)
                 score = float(candidate.get('score', 0.0))
                 if action_name and score > 0:
-                    if len(action_name) > 26:
-                        action_name = action_name[:23].rstrip() + '...'
-                    action_text = f'ACT {action_name} {score:.0%}'
+                    if len(action_name) > 18:
+                        action_name = action_name[:17].rstrip() + '…'
+                    action_text = f'动作：{action_name} {score:.0%}'
                     action_y = max(38, y1 - 32)
-                    cv2.putText(frame, action_text, (x1, action_y), font, 0.52,
-                                (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(frame, action_text, (x1, action_y), font, 0.52,
-                                (180, 70, 220), 1, cv2.LINE_AA)
+                    action_texts.append((action_text, x1, action_y))
         # 检测结果由推理进程序列化为 list，也兼容 numpy 数组；对异常结果
         # 做保护，保证绘图失败不会影响摄像头推流。
         try:
@@ -555,6 +655,8 @@ def draw_overlay(frame, detections, pose, stats=None, labels=None, actions=None)
                 cv2.circle(frame, point, 4, (255, 255, 255), 1, cv2.LINE_AA)
         except (IndexError, TypeError, ValueError, OverflowError):
             continue
+
+    _draw_action_texts(frame, action_texts)
 
 
 
