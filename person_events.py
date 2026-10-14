@@ -488,7 +488,30 @@ class PersonEventManager:
         for idx, (_det, _feat, pose) in enumerate(prepared):
             tid = assignments[idx]; tr = self.tracks[tid]
             self.labels.append((tid, tr["profile_id"], pose))
+        self._publish_skeletons(detections, now)
         return events
+
+    def _publish_skeletons(self, detections, now):
+        """Latest observed poses in RAM for independent temporal-model experiments."""
+        path = Path("/run/pose/skeleton.json")
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            payload = {
+                "timestamp": now, "monitor_pid": os.getpid(),
+                "frame_size": self._frame_size,
+                "people": [
+                    {"track_id": tid, "profile_id": pid, "pose": pose,
+                     "box": list(map(float, det[:4])),
+                     "keypoints": np.asarray(det[5]).tolist(),
+                     "confidence": np.asarray(det[6]).tolist()}
+                    for det, (tid, pid, pose) in zip(detections, self.labels)
+                ],
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            print(f"[Skeleton] publish failed: {type(exc).__name__}", flush=True)
 
     def publish_status(self, stream_fps, inference_fps, now=None, model_name=None):
         now = time.time() if now is None else now

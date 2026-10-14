@@ -6,6 +6,8 @@
 
 设备还包含用于对比测试的 YOLO26n-pose RK3576 INT8 模型，源码输出解码和转换脚本位于 `pose_build/`；当前服务已切换到该模型，旧的 YOLOv8n-pose 文件保留在设备上用于回退。
 
+YOLO26 关键点接 MotionBERT 动作分类的独立实验位于 [action_build/README.md](action_build/README.md)。pose 会将最新人物关键点写到内存中的 `/run/pose/skeleton.json`，供采样与模型验证；动作候选尚未作为正式事件通知。
+
 ### RK3576 ReID 模型
 
 设备上已转换并验证 OSNet-x0.25 ReID 模型：

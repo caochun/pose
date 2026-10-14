@@ -1,0 +1,54 @@
+{
+  "date": "2026-10-14",
+  "checkpoint": "MotionBERT NTU60 x-sub",
+  "source_revision": "705d3a95354db8bdb696b3492e47a3b5537174ff",
+  "observed_snapshots": 44,
+  "sequence_sampling_fps": "approximately 1",
+  "real_input_preprocessing_max_error": 9.499490261077881e-08,
+  "real_input_onnx_logit_max_error": 7.62939453125e-05,
+  "cpu_benchmarks": [
+    {
+      "configuration": "RK3576 CPU, two threads",
+      "input_frames": 32,
+      "mean_inference_ms": 4919.911286999316,
+      "peak_rss_mb": 492.578125,
+      "threads": 2,
+      "evaluated_windows": 5
+    },
+    {
+      "configuration": "RK3576 CPU, four big cores",
+      "input_frames": 32,
+      "mean_inference_ms": 3529.023615332941,
+      "peak_rss_mb": 486.66015625,
+      "threads": 4,
+      "evaluated_windows": 1
+    },
+    {
+      "configuration": "Mac CPU, 243-frame reference",
+      "input_frames": 243,
+      "mean_inference_ms": 1779.3979668058455,
+      "peak_rss_mb": 1345.15625,
+      "threads": 2,
+      "evaluated_windows": 5
+    }
+  ],
+  "limitations": [
+    "No labeled accuracy measurement",
+    "No idle/unknown class in NTU60",
+    "Short and full-length inputs produced different action candidates",
+    "No permanent action inference process or action event notifications"
+  ],
+  "rknn_conversion": {
+    "toolkit_version": "2.5.0",
+    "status": "not completed",
+    "stage_reached": "backend compilation",
+    "failure": "cgroup OOM at MemoryMax=1800M",
+    "rank4_attention_equivalence_verified": true,
+    "disabled_rules": [
+      "fuse_exmatmul_add_mul_exsoftmax13_exmatmul_to_sdpa",
+      "squeeze_nd_mul",
+      "swap_reshape_exsoftmax13"
+    ],
+    "runtime_on_npu": "not tested"
+  }
+}
