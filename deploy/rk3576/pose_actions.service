@@ -1,5 +1,5 @@
 [Unit]
-Description=MotionBERT action candidates from YOLO26 skeletons
+Description=ST-GCN++ action candidates from YOLO26 skeletons
 After=pose_monitor.service
 Wants=pose_monitor.service
 
@@ -9,7 +9,7 @@ User=root
 WorkingDirectory=/root/Develop/pose
 Environment=PYTHONUNBUFFERED=1
 Environment=MALLOC_ARENA_MAX=2
-ExecStart=/root/.cache/pose-motionbert/venv/bin/python -u /root/Develop/pose/action_build/live_motionbert.py /root/.cache/pose-motionbert/motionbert-ntu60-32.onnx --threads 2 --interval 15
+ExecStart=/root/.cache/pose-motionbert/venv/bin/python -u /root/Develop/pose/action_build/live_stgcnpp.py /root/.cache/pose-stgcnpp/stgcnpp-coco-2d.onnx --threads 2 --interval 15
 ExecStopPost=/usr/bin/rm -f /run/pose/actions.json /run/pose/actions.tmp
 CPUAffinity=4 5 6 7
 CPUQuota=200%
