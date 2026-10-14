@@ -86,6 +86,52 @@ KP_LEFT_HIP, KP_RIGHT_HIP = 11, 12
 KP_LEFT_KNEE, KP_RIGHT_KNEE = 13, 14
 KP_LEFT_ANKLE, KP_RIGHT_ANKLE = 15, 16
 
+# COCO 17 点骨骼连接（关键点索引从 0 开始）。
+# 每条线只有在两端关键点都足够可信时才绘制，避免遮挡或误检造成
+# 大量“飞线”。颜色使用 BGR，与 OpenCV 绘图接口一致。
+POSE_SKELETON = (
+    (KP_LEFT_ANKLE, KP_LEFT_KNEE),
+    (KP_LEFT_KNEE, KP_LEFT_HIP),
+    (KP_RIGHT_ANKLE, KP_RIGHT_KNEE),
+    (KP_RIGHT_KNEE, KP_RIGHT_HIP),
+    (KP_LEFT_HIP, KP_RIGHT_HIP),
+    (KP_LEFT_SHLDR, KP_LEFT_HIP),
+    (KP_RIGHT_SHLDR, KP_RIGHT_HIP),
+    (KP_LEFT_SHLDR, KP_RIGHT_SHLDR),
+    (KP_LEFT_SHLDR, KP_LEFT_ELBOW),
+    (KP_LEFT_ELBOW, KP_LEFT_WRIST),
+    (KP_RIGHT_SHLDR, KP_RIGHT_ELBOW),
+    (KP_RIGHT_ELBOW, KP_RIGHT_WRIST),
+    (KP_NOSE, KP_LEFT_EYE),
+    (KP_NOSE, KP_RIGHT_EYE),
+    (KP_LEFT_EYE, KP_LEFT_EAR),
+    (KP_RIGHT_EYE, KP_RIGHT_EAR),
+    (KP_LEFT_EAR, KP_LEFT_SHLDR),
+    (KP_RIGHT_EAR, KP_RIGHT_SHLDR),
+)
+
+# 颜色按身体部位分组，画面中能快速看出四肢左右关系，同时保持整体简洁。
+POSE_SKELETON_COLORS = (
+    (255, 120, 60), (255, 120, 60),  # 左腿
+    (60, 120, 255), (60, 120, 255),  # 右腿
+    (80, 220, 80), (80, 220, 80), (80, 220, 80), (80, 220, 80),  # 躯干
+    (255, 180, 40), (255, 180, 40),  # 左臂
+    (40, 180, 255), (40, 180, 255),  # 右臂
+    (200, 80, 220), (200, 80, 220), (200, 80, 220), (200, 80, 220),
+    (200, 80, 220), (200, 80, 220),  # 头部/颈部
+)
+POSE_KEYPOINT_COLORS = (
+    *((200, 80, 220),) * 5,  # 鼻、眼、耳
+    (80, 220, 80), (80, 220, 80),  # 肩
+    (255, 180, 40), (40, 180, 255),  # 肘
+    (255, 180, 40), (40, 180, 255),  # 腕
+    (80, 220, 80), (80, 220, 80),  # 髋
+    (255, 120, 60), (60, 120, 255),  # 膝
+    (255, 120, 60), (60, 120, 255),  # 踝
+)
+
+KEYPOINT_CONF_THRESHOLD = 0.30
+
 INPUT_SIZE  = 640
 CAMERA_FPS  = 5
 NMS_THRESH  = 0.45
@@ -431,7 +477,7 @@ def draw_panel(frame, pose, sitting_total, standing_total, stats):
 
 
 def draw_overlay(frame, detections, pose, stats=None, labels=None):
-    """久坐提醒横幅 + 检测框 + 关键点。每帧调用，开销低。"""
+    """久坐提醒横幅 + 检测框 + COCO 骨骼关键点。每帧调用，开销低。"""
     font = cv2.FONT_HERSHEY_SIMPLEX
     h, w = frame.shape[:2]
 
@@ -461,9 +507,36 @@ def draw_overlay(frame, detections, pose, stats=None, labels=None):
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         text = f'P{label_id} {label_pose}' if label_id is not None else label_pose
         cv2.putText(frame, text, (x1, max(20, y1 - 10)), font, 0.7, color, 2)
-        for ki in range(17):
-            if det[6][ki] > 0.3:
-                cv2.circle(frame, (int(det[5][ki][0]), int(det[5][ki][1])), 4, (255, 0, 0), -1)
+        # 检测结果由推理进程序列化为 list，也兼容 numpy 数组；对异常结果
+        # 做保护，保证绘图失败不会影响摄像头推流。
+        try:
+            keypoints = det[5]
+            keypoint_conf = det[6]
+            if len(keypoints) < 17 or len(keypoint_conf) < 17:
+                continue
+
+            visible = [float(keypoint_conf[ki]) >= KEYPOINT_CONF_THRESHOLD
+                       and 0 <= keypoints[ki][0] < w
+                       and 0 <= keypoints[ki][1] < h
+                       for ki in range(17)]
+
+            # 先画骨骼再画点，使关键点圆点保持清晰可见。
+            for edge_idx, (a, b) in enumerate(POSE_SKELETON):
+                if not (visible[a] and visible[b]):
+                    continue
+                pa = (int(keypoints[a][0]), int(keypoints[a][1]))
+                pb = (int(keypoints[b][0]), int(keypoints[b][1]))
+                cv2.line(frame, pa, pb,
+                         POSE_SKELETON_COLORS[edge_idx], 2, cv2.LINE_AA)
+
+            for ki, is_visible in enumerate(visible):
+                if not is_visible:
+                    continue
+                point = (int(keypoints[ki][0]), int(keypoints[ki][1]))
+                cv2.circle(frame, point, 4, POSE_KEYPOINT_COLORS[ki], -1, cv2.LINE_AA)
+                cv2.circle(frame, point, 4, (255, 255, 255), 1, cv2.LINE_AA)
+        except (IndexError, TypeError, ValueError, OverflowError):
+            continue
 
 
 
